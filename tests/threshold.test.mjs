@@ -4,110 +4,138 @@ import test from 'node:test'
 import { loadPlugin } from './helpers/load-plugin.mjs'
 
 /**
- * The compaction threshold CANNOT be derived from config.
+ * Le seuil de compaction n'est pas librement calculable, mais il est parfois
+ * DÉMONTRABLE. Le runtime fait, dans l'ordre :
  *
- * Verified in agent/context_compressor.py, the runtime resolves it as:
- *   1. threshold_percent = config `threshold`, then per-model override,
- *      then RAISED to 0.75 for any window < 512_000 (_effective_threshold_percent);
- *   2. effective_window = context_length - max_tokens  (the provider's output
- *      reservation, which no plugin-reachable read exposes);
- *   3. tokens = effective_window * threshold_percent, floored at
- *      MINIMUM_CONTEXT_LENGTH, with an 85% degenerate-window fallback;
- *   4. threshold_tokens is applied as a CAP via min(), not as a winner
- *      (_apply_threshold_tokens_cap).
+ *   pct    = model_thresholds | compression.threshold | 0.50
+ *   pct    = max(pct, 0.75) si la fenêtre < 512_000
+ *   ratio  = max((fenêtre - max_tokens) * pct, 64_000)
+ *   seuil  = min(ratio, compression.threshold_tokens)   <- un PLAFOND
  *
- * Reproducing that from `config.get` alone yields a wrong number, so the
- * honest answer is unknown until the runtime exposes the effective value.
+ * Seul `max_tokens` (la réserve de sortie du provider) est invisible. Or
+ * `ratio` ne fait que DÉCROÎTRE quand `max_tokens` augmente. Donc si le
+ * plafond est déjà inférieur au ratio calculé avec une réserve de sortie
+ * généreuse, le plafond gagne pour toute valeur réelle : c'est une preuve,
+ * pas une estimation.
  */
 
-test('the threshold is unknown even when the config is fully readable', async () => {
+test('le plafond est affiché quand il gagne quelle que soit la réserve de sortie', async () => {
   const plugin = await loadPlugin()
 
-  const request = async method => {
-    if (method === 'process.list') return { processes: [] }
-    // A config read would still not be enough, so it must not be attempted.
-    throw new Error(`unexpected RPC ${method}`)
-  }
-
-  const snapshot = await plugin.loadSessionPulse({
-    request,
-    sessionId: 'tab-a',
-    usage: {
-      context_used: 42_000,
-      context_max: 200_000,
-      compressions: 1,
-      model: 'claude-opus-5'
-    },
-    subagents: null
+  // Cas réel : fenêtre 1M, seuil 0.9, plafond 250k.
+  // Le ratio reste au-dessus de 780k même avec 128k de réserve : le plafond gagne.
+  const threshold = plugin.resolveThreshold({
+    config: { compression: { threshold: 0.9, threshold_tokens: 250_000 } },
+    contextMax: 1_000_000,
+    model: 'claude-opus-5',
+    usage: null
   })
 
-  assert.equal(snapshot.thresholdTokens, null)
-  // The values that ARE trustworthy must survive.
-  assert.equal(snapshot.activeTokens, 42_000)
-  assert.equal(snapshot.maxTokens, 200_000)
-  assert.equal(snapshot.compactions, 1)
+  assert.equal(threshold, 250_000)
 })
 
-test('no config read is issued at all', async () => {
+test('le seuil reste inconnu quand le plafond est trop proche du ratio', async () => {
   const plugin = await loadPlugin()
-  const calls = []
-  const request = async method => {
-    calls.push(method)
-    if (method === 'process.list') return { processes: [] }
-    throw new Error(`unexpected RPC ${method}`)
-  }
 
-  await plugin.loadSessionPulse({
-    request,
-    sessionId: 'tab-a',
-    usage: { context_used: 1, context_max: 200_000 },
-    subagents: null
+  // Plafond 850k : au-dessus du ratio du pire cas (~785k) mais en dessous du
+  // ratio d'une petite réserve de sortie (~896k). C'est donc `max_tokens`,
+  // inconnu, qui décide. On ne peut rien prouver.
+  const threshold = plugin.resolveThreshold({
+    config: { compression: { threshold: 0.9, threshold_tokens: 850_000 } },
+    contextMax: 1_000_000,
+    model: 'claude-opus-5',
+    usage: null
   })
 
-  assert.deepEqual(calls, ['process.list'])
-  assert.ok(!calls.includes('config.get'), 'config must not be read at all')
+  assert.equal(threshold, null)
 })
 
-test('the runtime threshold is preferred when the runtime ever reports it', async () => {
+test('sans plafond configuré le seuil reste inconnu', async () => {
   const plugin = await loadPlugin()
-  const request = async method => {
-    if (method === 'process.list') return { processes: [] }
-    throw new Error(`unexpected RPC ${method}`)
-  }
 
-  // Forward-compatible: if a future runtime adds the effective threshold to the
-  // streamed usage payload, use it verbatim rather than deriving anything.
-  const snapshot = await plugin.loadSessionPulse({
-    request,
-    sessionId: 'tab-a',
-    usage: {
-      context_used: 42_000,
-      context_max: 200_000,
-      threshold_tokens: 171_000
-    },
-    subagents: null
+  // Sans plafond, le résultat dépend directement de `max_tokens`.
+  const threshold = plugin.resolveThreshold({
+    config: { compression: { threshold: 0.9 } },
+    contextMax: 1_000_000,
+    model: 'claude-opus-5',
+    usage: null
   })
 
-  assert.equal(snapshot.thresholdTokens, 171_000)
+  assert.equal(threshold, null)
 })
 
-test('a reported threshold is still clamped to the window', async () => {
+test('un seuil rapporté par le runtime est toujours préféré', async () => {
   const plugin = await loadPlugin()
-  const request = async method => {
-    if (method === 'process.list') return { processes: [] }
-    throw new Error(`unexpected RPC ${method}`)
-  }
 
-  const snapshot = await plugin.loadSessionPulse({
-    request,
-    sessionId: 'tab-a',
-    usage: {
-      context_used: 1_000,
-      context_max: 128_000,
-      context_threshold: 999_000
-    },
-    subagents: null
+  const threshold = plugin.resolveThreshold({
+    config: { compression: { threshold: 0.9, threshold_tokens: 250_000 } },
+    contextMax: 1_000_000,
+    model: 'claude-opus-5',
+    usage: { threshold_tokens: 187_000 }
   })
 
-  assert.equal(snapshot.thresholdTokens, 128_000)
+  assert.equal(threshold, 187_000)
+})
+
+test('la compaction désactivée ne promet aucun seuil', async () => {
+  const plugin = await loadPlugin()
+
+  const threshold = plugin.resolveThreshold({
+    config: {
+      compression: { enabled: false, threshold: 0.9, threshold_tokens: 250_000 }
+    },
+    contextMax: 1_000_000,
+    model: 'claude-opus-5',
+    usage: null
+  })
+
+  assert.equal(threshold, null)
+})
+
+test('le plancher des petites fenêtres est appliqué avant la preuve', async () => {
+  const plugin = await loadPlugin()
+
+  // Fenêtre 128k : le runtime relève le pourcentage à 0.75 même si 0.50 est
+  // configuré. Le plafond 40k reste bien en dessous du ratio, donc il gagne.
+  const threshold = plugin.resolveThreshold({
+    config: { compression: { threshold: 0.5, threshold_tokens: 40_000 } },
+    contextMax: 128_000,
+    model: 'claude-opus-5',
+    usage: null
+  })
+
+  assert.equal(threshold, 40_000)
+})
+
+test('un plafond supérieur à la fenêtre est sans effet, donc non prouvable', async () => {
+  const plugin = await loadPlugin()
+
+  const threshold = plugin.resolveThreshold({
+    config: { compression: { threshold: 0.9, threshold_tokens: 9_000_000 } },
+    contextMax: 1_000_000,
+    model: 'claude-opus-5',
+    usage: null
+  })
+
+  assert.equal(threshold, null)
+})
+
+test('un seuil par modèle est pris en compte dans la preuve', async () => {
+  const plugin = await loadPlugin()
+
+  const threshold = plugin.resolveThreshold({
+    config: {
+      compression: {
+        threshold: 0.9,
+        threshold_tokens: 250_000,
+        model_thresholds: { 'claude-opus': 0.5 }
+      }
+    },
+    contextMax: 1_000_000,
+    model: 'claude-opus-5',
+    usage: null
+  })
+
+  // pct 0.5 -> ratio ~436k avec 128k de réserve : 250k reste prouvable.
+  assert.equal(threshold, 250_000)
 })

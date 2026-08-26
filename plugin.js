@@ -110,37 +110,117 @@ export function createSubagentTracker({ maxSessions = DEFAULT_MAX_TRACKED_SESSIO
   }
 }
 
-// The compaction threshold CANNOT be honestly derived. It lives on
-// `agent.context_compressor` and is serialised by no plugin-reachable read,
-// and the runtime's resolution (agent/context_compressor.py) needs inputs no
-// plugin can see:
+// ── Seuil de compaction ─────────────────────────────────────────────────────
 //
-//   1. threshold_percent = config `threshold`, then a per-model override, then
-//      RAISED to 0.75 for ANY window below 512_000 (_effective_threshold_percent
-//      — so a 128K model does NOT keep a configured 0.50);
-//   2. the percentage applies to `context_length - max_tokens`, the provider's
-//      output reservation, which no RPC exposes;
-//   3. the result is floored at MINIMUM_CONTEXT_LENGTH with an 85%
-//      degenerate-window fallback;
-//   4. `threshold_tokens` is applied as a CAP via min(), not as a winner
-//      (_apply_threshold_tokens_cap);
-//   5. provider autoraises and external context engines can override all of it.
+// Le runtime résout le seuil ainsi (agent/context_compressor.py) :
 //
-// Reproducing that from `config.get` produces a confident wrong number, which
-// is worse than admitting ignorance. So we only report a threshold the runtime
-// itself hands us, and otherwise render unknown. See issue: exposing the
-// compressor's effective threshold_tokens on session.usage would fix this.
-export function readReportedThreshold({ usage, contextMax }) {
-  const reported = finiteOrNull(
-    usage?.context_threshold ??
-      usage?.threshold_tokens ??
-      usage?.compaction_threshold
+//   pct   = model_thresholds | compression.threshold | 0.50
+//   pct   = max(pct, 0.75)  si la fenêtre < 512_000   (_effective_threshold_percent)
+//   ratio = max((fenêtre - max_tokens) * pct, 64_000) (_compute_threshold_tokens)
+//   seuil = min(ratio, compression.threshold_tokens)  (_apply_threshold_tokens_cap)
+//
+// Seul `max_tokens`, la réserve de sortie du provider, est invisible pour un
+// plugin. Mais `ratio` DÉCROÎT quand `max_tokens` croît : si le plafond
+// configuré est déjà inférieur au ratio calculé avec une réserve de sortie
+// généreuse, alors le plafond gagne pour toute valeur réelle de `max_tokens`.
+// C'est une démonstration, pas une estimation — et elle couvre le cas courant
+// d'un `threshold_tokens` explicitement configuré.
+//
+// Hors de ce cas, le seuil reste inconnu plutôt que deviné.
+
+const RUNTIME_DEFAULT_THRESHOLD = 0.5
+const SMALL_WINDOW_LIMIT = 512_000
+const SMALL_WINDOW_FLOOR = 0.75
+const MINIMUM_CONTEXT_LENGTH = 64_000
+// Réserve de sortie maximale plausible. Une valeur haute rend la preuve plus
+// exigeante, donc plus sûre : on ne conclut que si le plafond gagne même dans
+// le cas le plus défavorable.
+const MAX_PLAUSIBLE_OUTPUT_RESERVE = 128_000
+
+const asFraction = value => {
+  const number = finiteOrNull(value)
+  if (number === null || number <= 0 || number > 1) return null
+  return number
+}
+
+// Reproduit resolve_model_threshold : correspondance par sous-chaîne sur le nom
+// du modèle, la clé la plus longue gagnant.
+const modelThresholdFraction = (modelThresholds, model) => {
+  if (!modelThresholds || typeof modelThresholds !== 'object') return null
+  const name = String(model || '')
+  if (!name) return null
+  let bestKey = null
+  for (const key of Object.keys(modelThresholds)) {
+    if (!key || !name.includes(key)) continue
+    if (bestKey === null || key.length > bestKey.length) bestKey = key
+  }
+  return bestKey === null ? null : asFraction(modelThresholds[bestKey])
+}
+
+// Reproduit agent_init.py : enabled sauf désactivation explicite.
+const compressionEnabled = compression => {
+  const raw = compression?.enabled
+  if (raw === undefined || raw === null) return true
+  return ['true', '1', 'yes'].includes(String(raw).toLowerCase())
+}
+
+const reportedThreshold = usage =>
+  finiteOrNull(
+    usage?.context_threshold ?? usage?.threshold_tokens ?? usage?.compaction_threshold
   )
-  if (!reported) return null
+
+export function resolveThreshold({ config, contextMax, model, usage }) {
   const max = finiteOrNull(contextMax)
-  // A threshold beyond the window can never be reached; clamp so the display
-  // stays coherent.
-  return max ? Math.min(max, reported) : reported
+
+  // 1. Ce que le runtime rapporte lui-même gagne toujours.
+  const reported = reportedThreshold(usage)
+  if (reported) return max ? Math.min(max, reported) : reported
+
+  if (!max) return null
+
+  const compression = config?.compression
+  // Un compresseur désactivé ne compacte jamais : aucun seuil à annoncer.
+  if (!compressionEnabled(compression)) return null
+
+  // 2. Sinon, le plafond absolu — mais seulement s'il est démontrablement
+  //    gagnant.
+  const cap = finiteOrNull(compression?.threshold_tokens)
+  if (!cap || cap >= max) return null
+
+  let pct =
+    modelThresholdFraction(compression?.model_thresholds, model) ??
+    asFraction(compression?.threshold) ??
+    RUNTIME_DEFAULT_THRESHOLD
+  if (max < SMALL_WINDOW_LIMIT) pct = Math.max(pct, SMALL_WINDOW_FLOOR)
+
+  // Ratio dans le cas le plus défavorable au plafond : la plus grosse réserve
+  // de sortie plausible, donc le plus petit ratio possible.
+  const worstCaseWindow = Math.max(max - MAX_PLAUSIBLE_OUTPUT_RESERVE, 1)
+  const worstCaseRatio = Math.max(
+    Math.trunc(worstCaseWindow * pct),
+    MINIMUM_CONTEXT_LENGTH
+  )
+
+  // Le plafond gagne même dans ce cas : il gagne donc toujours.
+  return cap < worstCaseRatio ? cap : null
+}
+
+// ── Compactions ─────────────────────────────────────────────────────────────
+//
+// `compression_count` ne vit qu'en mémoire côté runtime : il repart à zéro à
+// chaque reprise de session ou redémarrage, alors que la conversation a bien
+// été compactée. Ce zéro est donc parfois faux, et il est détectable : si le
+// contexte occupé dépasse le seuil de compaction, au moins une compaction a
+// forcément eu lieu. On préfère alors `—` à un « 0 » faux.
+export function trustedCompactions({ compactions, activeTokens, thresholdTokens }) {
+  const count = finiteOrNull(compactions)
+  if (count === null || count > 0) return count
+
+  const used = finiteOrNull(activeTokens)
+  const threshold = finiteOrNull(thresholdTokens)
+  if (used === null || !threshold) return count
+
+  return used >= threshold ? null : count
 }
 
 const UNKNOWN = '—'
@@ -201,11 +281,16 @@ const EMPTY_SNAPSHOT = {
   processes: null
 }
 
-// `subagents` is supplied by the caller's event-stream tracker, not fetched:
-// every subagent RPC on the gateway is global, and a global count attributed to
-// one tab would be a lie. The threshold likewise comes only from what the
-// runtime reports — never from a config-derived guess.
-export async function loadSessionPulse({ request, sessionId, usage, subagents = null }) {
+// `subagents` vient du suivi d'événements de l'appelant, pas d'une requête :
+// toute RPC de sous-agents est globale, et un décompte global attribué à un
+// onglet serait un mensonge.
+export async function loadSessionPulse({
+  request,
+  sessionId,
+  usage,
+  subagents = null,
+  config = null
+}) {
   if (!sessionId) return { ...EMPTY_SNAPSHOT }
 
   const [processResult] = await Promise.allSettled([
@@ -213,12 +298,25 @@ export async function loadSessionPulse({ request, sessionId, usage, subagents = 
   ])
 
   const maxTokens = finiteOrNull(usage?.context_max)
+  const activeTokens = finiteOrNull(usage?.context_used)
+  const thresholdTokens = resolveThreshold({
+    config,
+    contextMax: maxTokens,
+    model: usage?.model,
+    usage
+  })
 
   return {
-    activeTokens: finiteOrNull(usage?.context_used),
-    thresholdTokens: readReportedThreshold({ usage, contextMax: maxTokens }),
+    activeTokens,
+    thresholdTokens,
     maxTokens,
-    compactions: finiteOrNull(usage?.compressions),
+    // Le compteur du runtime repart à zéro après une reprise : on refuse un
+    // zéro que le dépassement du seuil contredit.
+    compactions: trustedCompactions({
+      compactions: usage?.compressions,
+      activeTokens,
+      thresholdTokens
+    }),
     subagents: finiteOrNull(subagents),
     processes:
       processResult.status === 'fulfilled' ? runningProcessCount(processResult.value) : null
@@ -249,36 +347,51 @@ function SessionPulseChip({ tracker }) {
   const globalActive =
     typeof usage?.active_subagents === 'number' ? usage.active_subagents : null
 
+  // Le bloc `compression` de la configuration change rarement : on le lit une
+  // fois et on le garde en cache. Seul ce bloc est retenu, rien d'autre de la
+  // configuration n'est conservé ni affiché.
+  const { data: compression } = useQuery({
+    queryKey: [PLUGIN_ID, 'compression'],
+    staleTime: 5 * 60_000,
+    queryFn: async () => {
+      const answer = await host.request('config.get', { key: 'full' })
+      const block = answer?.config?.compression
+      return block && typeof block === 'object' ? block : {}
+    }
+  })
+
   const { data } = useQuery({
-    // The session id is part of the key, so switching tabs is a different
-    // query rather than a stale render of the previous tab's numbers.
+    // L'identifiant de session fait partie de la clé : changer d'onglet est une
+    // requête différente, pas un réaffichage des chiffres de l'onglet précédent.
     queryKey: [
       PLUGIN_ID,
       sessionId,
-      // The model affects any threshold the runtime reports, so a model switch
-      // must not serve the previous model's number.
+      // Le modèle change le seuil : ne pas resservir celui du modèle précédent.
       usage?.model ?? null,
       usage?.context_used ?? null,
       usage?.context_max ?? null,
       usage?.compressions ?? null,
-      globalActive
+      globalActive,
+      compression ? 'cfg' : 'nocfg'
     ],
     enabled: Boolean(sessionId),
-    // process.list is cheap and session-scoped; a few seconds is plenty.
+    // `process.list` est peu coûteuse et session-scopée : quelques secondes
+    // suffisent.
     refetchInterval: 5_000,
-    // Deliberately NO placeholderData. `previous => previous` would re-serve
-    // the PREVIOUS tab's snapshot under the newly focused tab while its own
-    // reads are still in flight — the exact cross-tab leak this plugin exists
-    // to avoid. A loading tab shows `—`, which is honest and holds the layout.
+    // Volontairement PAS de `placeholderData`. `previous => previous`
+    // resservirait l'instantané de l'onglet PRÉCÉDENT sous l'onglet
+    // fraîchement focalisé pendant le chargement — exactement la fuite que ce
+    // plugin existe pour éviter. Un onglet en chargement affiche `—`.
     queryFn: () => {
-      // Tracker updates belong here, not in the render body: rendering must
-      // stay free of side effects.
+      // Les mises à jour du suivi vont ici, pas dans le corps du rendu : le
+      // rendu doit rester sans effet de bord.
       tracker.observeGlobalActive(globalActive)
       return loadSessionPulse({
         request: (method, params) => host.request(method, params),
         sessionId,
         usage,
-        subagents: tracker.countFor(sessionId)
+        subagents: tracker.countFor(sessionId),
+        config: compression ? { compression } : null
       })
     }
   })

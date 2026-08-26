@@ -72,12 +72,16 @@ test('the query does not opt into cross-tab placeholder data', async () => {
     focusedUsage: null
   })
 
-  assert.equal(queryCalls.length, 1)
-  assert.equal(
-    queryCalls[0].placeholderData,
-    undefined,
-    'placeholderData re-serves the previous observer result across a focus switch'
-  )
+  // Aucune des requêtes (configuration et instantané) ne doit resservir le
+  // résultat précédent lors d'un changement d'onglet.
+  assert.ok(queryCalls.length >= 1)
+  for (const options of queryCalls) {
+    assert.equal(
+      options.placeholderData,
+      undefined,
+      'placeholderData resservirait le résultat de l’onglet précédent'
+    )
+  }
 })
 
 test('the focused session id is part of the query key', async () => {
@@ -86,9 +90,13 @@ test('the focused session id is part of the query key', async () => {
     focusedUsage: { context_used: 10, context_max: 100 }
   })
 
-  assert.ok(
-    queryCalls[0].queryKey.includes('tab-abc'),
-    'without the session id in the key, two tabs would share one cache entry'
+  // La requête de l'instantané est celle qui porte l'identité de l'onglet ; la
+  // requête de configuration est volontairement partagée entre les onglets.
+  const scoped = queryCalls.filter(options => options.queryKey.includes('tab-abc'))
+  assert.equal(
+    scoped.length,
+    1,
+    'sans identifiant de session dans la clé, deux onglets partageraient un cache'
   )
 })
 

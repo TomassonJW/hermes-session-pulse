@@ -4,7 +4,7 @@
     {
       "name": "gateway reachable (session.create)",
       "ok": true,
-      "detail": "session_id=81c35284"
+      "detail": "session_id=8abb1489"
     },
     {
       "name": "delegation.async_status is absent",
@@ -52,11 +52,6 @@
       "detail": "{\"activeTokens\":null,\"thresholdTokens\":null,\"maxTokens\":null,\"compactions\":0,\"subagents\":null,\"processes\":0}"
     },
     {
-      "name": "threshold reads unknown rather than a derived guess",
-      "ok": true,
-      "detail": "thresholdTokens=null"
-    },
-    {
       "name": "formatPulseLine end-to-end",
       "ok": true,
       "detail": "— / — / — · C0 · A— · P0"
@@ -70,6 +65,21 @@
       "name": "accessibleLabel end-to-end",
       "ok": true,
       "detail": "Context in use: unknown tokens. compaction expected at: unknown tokens. model limit: unknown tokens. compactions so far: 0. active subagents: unknown. active processes: 0."
+    },
+    {
+      "name": "cas réel: le seuil est démontré depuis la config live",
+      "ok": true,
+      "detail": "seuil=250000 (plafond configuré=250000)"
+    },
+    {
+      "name": "cas réel: C0 incohérent devient inconnu",
+      "ok": true,
+      "detail": "compactions=null car 381k >= seuil"
+    },
+    {
+      "name": "cas réel: ligne affichée",
+      "ok": true,
+      "detail": "381k / 250k / 1000k · C— · A— · P0"
     }
   ]
 }
