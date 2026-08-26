@@ -111,3 +111,40 @@ utilisé.
   conservé ni affiché.
 - Aucune mutation : pas de `slash.exec`, pas de `delegation.pause`, pas de
   `process.kill`.
+
+## Défauts trouvés par revue hostile indépendante
+
+Une revue adverse en lecture seule a été passée sur le plugin après la première
+version verte. Elle a trouvé deux défauts réels, corrigés en TDD.
+
+### Fuite entre onglets par `placeholderData` (critique)
+
+`useQuery` était configuré avec `placeholderData: previous => previous`. React
+Query sert alors le dernier résultat observé pendant le chargement de la nouvelle
+clé : au changement d'onglet, les chiffres de l'onglet précédent s'affichaient
+sous le nouvel onglet jusqu'à la fin de ses propres lectures. C'était exactement
+la fuite que ce plugin existe pour éviter.
+
+Corrigé en retirant `placeholderData`. Un onglet en cours de chargement affiche
+`—`, ce qui est honnête et conserve la mise en page. Les tests de
+`tests/focus-isolation.test.mjs` invoquent le composant réel et échouent si
+`placeholderData` est réintroduit.
+
+### Seuil affiché alors que la compaction est désactivée (élevé)
+
+`compression.enabled: false` signifie que le runtime ne compacte jamais
+automatiquement. Le seuil était pourtant calculé et affiché, ce qui annonçait une
+compaction qui n'arriverait pas. `deriveThreshold` retourne désormais `null` dans
+ce cas, en reproduisant la lecture du runtime
+(`str(compression.get("enabled", True)).lower() in {"true","1","yes"}`).
+
+### Fuite mémoire du suivi de sous-agents
+
+Trouvée en vérifiant une hypothèse avant la revue : le code s'abonnait à
+`session.closed` pour oublier un onglet fermé. Cet événement **n'existe pas** ; le
+gateway émet `session.info` et `session.usage`. Le `Map` grossissait donc d'une
+entrée par session vue. Le suivi est maintenant borné par LRU, et un onglet évincé
+redevient inconnu (`—`) au lieu de retourner un faux zéro.
+
+Au passage, ce correctif a supprimé un bug latent : `if (live)` traitait un `Set`
+vide comme faux, donc un onglet à zéro vérifié retombait sur l'inférence globale.

@@ -4,7 +4,7 @@
     {
       "name": "gateway reachable (session.create)",
       "ok": true,
-      "detail": "session_id=e441dde8"
+      "detail": "session_id=cb4122cd"
     },
     {
       "name": "delegation.async_status is absent",

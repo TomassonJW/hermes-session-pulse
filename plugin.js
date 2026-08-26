@@ -125,11 +125,23 @@ const modelThresholdFraction = (modelThresholds, model) => {
   return bestKey === null ? null : asFraction(modelThresholds[bestKey])
 }
 
+// Mirrors agent_init.py: str(compression.get("enabled", True)).lower() in
+// {"true","1","yes"} — enabled unless explicitly turned off.
+const compressionEnabled = compression => {
+  const raw = compression?.enabled
+  if (raw === undefined || raw === null) return true
+  return ['true', '1', 'yes'].includes(String(raw).toLowerCase())
+}
+
 export function deriveThreshold({ config, contextMax, model }) {
   const max = finiteOrNull(contextMax)
   if (!max) return null
 
   const compression = config?.compression
+  // A disabled compressor never auto-compacts, so there is no compaction point
+  // to announce. Showing one would be a fabricated expectation.
+  if (!compressionEnabled(compression)) return null
+
   const clamp = value => Math.min(max, value)
 
   const absolute = finiteOrNull(compression?.threshold_tokens)
@@ -266,7 +278,10 @@ function SessionPulseChip({ tracker }) {
     enabled: Boolean(sessionId),
     // process.list is cheap and session-scoped; a few seconds is plenty.
     refetchInterval: 5_000,
-    placeholderData: previous => previous,
+    // Deliberately NO placeholderData. `previous => previous` would re-serve
+    // the PREVIOUS tab's snapshot under the newly focused tab while its own
+    // reads are still in flight — the exact cross-tab leak this plugin exists
+    // to avoid. A loading tab shows `—`, which is honest and holds the layout.
     queryFn: () => {
       // Tracker updates belong here, not in the render body: rendering must
       // stay free of side effects.

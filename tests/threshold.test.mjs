@@ -137,6 +137,35 @@ test('a nonsensical threshold falls back to the runtime default', async () => {
   }
 })
 
+test('a disabled compressor has no compaction point at all', async () => {
+  const plugin = await loadPlugin()
+
+  // compression.enabled: false means the runtime never auto-compacts, so
+  // presenting any threshold would be a fabricated expectation.
+  const threshold = plugin.deriveThreshold({
+    config: {
+      compression: { enabled: false, threshold: 0.9, threshold_tokens: 250_000 }
+    },
+    contextMax: 200_000,
+    model: 'claude-opus-5'
+  })
+
+  assert.equal(threshold, null)
+})
+
+test('compression enabled by omission still yields a threshold', async () => {
+  const plugin = await loadPlugin()
+
+  // The runtime default is enabled=True, so an absent key must not disable it.
+  const threshold = plugin.deriveThreshold({
+    config: { compression: { threshold: 0.5 } },
+    contextMax: 128_000,
+    model: 'claude-opus-5'
+  })
+
+  assert.equal(threshold, 64_000)
+})
+
 test('the threshold stays unknown without a context maximum', async () => {
   const plugin = await loadPlugin()
 

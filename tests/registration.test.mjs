@@ -72,16 +72,21 @@ test('a subagent event on one tab does not affect another tab', async () => {
   const wildcard = listeners.find(entry => entry.type === '*')
   assert.ok(wildcard, 'expected a wildcard event subscription')
 
-  // Feed a real gateway frame shape through the live listener.
+  // Feed real gateway frame shapes through the live listener, then assert the
+  // isolation directly on a tracker driven the same way.
   wildcard.fn({
     type: 'subagent.start',
     session_id: 'tab-a',
     payload: { subagent_id: 's1' }
   })
-
-  // No throw and no cross-tab leakage: the tracker is internal, so we assert
-  // the listener tolerates the frame and stays silent for other shapes.
   wildcard.fn({ type: 'message.delta', session_id: 'tab-b', payload: {} })
+
+  const tracker = plugin.createSubagentTracker()
+  tracker.observe('subagent.start', 'tab-a', { subagent_id: 's1' })
+  tracker.observe('message.delta', 'tab-b', {})
+
+  assert.equal(tracker.countFor('tab-a'), 1)
+  assert.equal(tracker.countFor('tab-b'), null, 'a non-subagent event must not create a tab')
 })
 
 test('a malformed event frame never throws out of the listener', async () => {
