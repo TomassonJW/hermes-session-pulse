@@ -9,7 +9,7 @@ test('formatTokenCount renders a compact whole-thousand value', async () => {
   assert.equal(plugin.formatTokenCount(42_000), '42k')
 })
 
-test('loadSessionPulse scopes its only read to the focused runtime', async () => {
+test('loadSessionPulse scopes its session read to the focused runtime', async () => {
   const plugin = await loadPlugin()
   const calls = []
   const request = async (method, params) => {
@@ -17,6 +17,8 @@ test('loadSessionPulse scopes its only read to the focused runtime', async () =>
     if (method === 'process.list') {
       return { processes: [{ status: 'running' }, { status: 'exited' }] }
     }
+    // La configuration est globale au profil, pas propre à une session.
+    if (method === 'config.get') return { config: {} }
     throw new Error(`unexpected RPC ${method}`)
   }
 
@@ -32,7 +34,9 @@ test('loadSessionPulse scopes its only read to the focused runtime', async () =>
     subagents: 2
   })
 
-  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+  // La seule lecture portant une identité de session doit être scopée.
+  const sessionScoped = calls.filter(([method]) => method === 'process.list')
+  assert.deepEqual(JSON.parse(JSON.stringify(sessionScoped)), [
     ['process.list', { session_id: 'runtime-tab-b' }]
   ])
   assert.deepEqual(JSON.parse(JSON.stringify(snapshot)), {

@@ -281,6 +281,38 @@ const EMPTY_SNAPSHOT = {
   processes: null
 }
 
+// Le bloc `compression` de la configuration ne change quasiment jamais, mais
+// une requête séparée mise en cache cinq minutes rendait le seuil inconnu de
+// façon durable dès que la toute première lecture échouait (socket du gateway
+// pas encore ouverte au montage, changement de profil en cours). On mémorise
+// donc uniquement les SUCCÈS : un échec transitoire est réessayé au
+// rafraîchissement suivant, cinq secondes plus tard.
+let cachedCompression = null
+
+export function __resetCompressionCache() {
+  cachedCompression = null
+}
+
+const readCompression = async request => {
+  if (cachedCompression) return cachedCompression
+  try {
+    const answer = await request('config.get', { key: 'full' })
+    const block = answer?.config?.compression
+    if (block && typeof block === 'object') {
+      cachedCompression = block
+      return block
+    }
+    // Une configuration sans bloc `compression` est une réponse valide : le
+    // runtime appliquera ses défauts, dont aucun plafond. Mémorisée telle
+    // quelle pour ne pas re-interroger en boucle.
+    cachedCompression = {}
+    return cachedCompression
+  } catch {
+    // Volontairement pas mémorisé : on réessaiera.
+    return null
+  }
+}
+
 // `subagents` vient du suivi d'événements de l'appelant, pas d'une requête :
 // toute RPC de sous-agents est globale, et un décompte global attribué à un
 // onglet serait un mensonge.
@@ -293,14 +325,20 @@ export async function loadSessionPulse({
 }) {
   if (!sessionId) return { ...EMPTY_SNAPSHOT }
 
-  const [processResult] = await Promise.allSettled([
-    request('process.list', { session_id: sessionId })
+  const [processResult, compression] = await Promise.all([
+    request('process.list', { session_id: sessionId }).then(
+      value => ({ ok: true, value }),
+      () => ({ ok: false })
+    ),
+    // Une configuration explicitement fournie (tests, appelant qui l'a déjà)
+    // court-circuite la lecture.
+    config?.compression ? Promise.resolve(config.compression) : readCompression(request)
   ])
 
   const maxTokens = finiteOrNull(usage?.context_max)
   const activeTokens = finiteOrNull(usage?.context_used)
   const thresholdTokens = resolveThreshold({
-    config,
+    config: compression ? { compression } : null,
     contextMax: maxTokens,
     model: usage?.model,
     usage
@@ -318,8 +356,7 @@ export async function loadSessionPulse({
       thresholdTokens
     }),
     subagents: finiteOrNull(subagents),
-    processes:
-      processResult.status === 'fulfilled' ? runningProcessCount(processResult.value) : null
+    processes: processResult.ok ? runningProcessCount(processResult.value) : null
   }
 }
 
@@ -347,19 +384,6 @@ function SessionPulseChip({ tracker }) {
   const globalActive =
     typeof usage?.active_subagents === 'number' ? usage.active_subagents : null
 
-  // Le bloc `compression` de la configuration change rarement : on le lit une
-  // fois et on le garde en cache. Seul ce bloc est retenu, rien d'autre de la
-  // configuration n'est conservé ni affiché.
-  const { data: compression } = useQuery({
-    queryKey: [PLUGIN_ID, 'compression'],
-    staleTime: 5 * 60_000,
-    queryFn: async () => {
-      const answer = await host.request('config.get', { key: 'full' })
-      const block = answer?.config?.compression
-      return block && typeof block === 'object' ? block : {}
-    }
-  })
-
   const { data } = useQuery({
     // L'identifiant de session fait partie de la clé : changer d'onglet est une
     // requête différente, pas un réaffichage des chiffres de l'onglet précédent.
@@ -371,8 +395,7 @@ function SessionPulseChip({ tracker }) {
       usage?.context_used ?? null,
       usage?.context_max ?? null,
       usage?.compressions ?? null,
-      globalActive,
-      compression ? 'cfg' : 'nocfg'
+      globalActive
     ],
     enabled: Boolean(sessionId),
     // `process.list` est peu coûteuse et session-scopée : quelques secondes
@@ -390,8 +413,7 @@ function SessionPulseChip({ tracker }) {
         request: (method, params) => host.request(method, params),
         sessionId,
         usage,
-        subagents: tracker.countFor(sessionId),
-        config: compression ? { compression } : null
+        subagents: tracker.countFor(sessionId)
       })
     }
   })
