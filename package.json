@@ -1,0 +1,15 @@
+{
+  "name": "hermes-session-pulse",
+  "version": "0.1.0",
+  "description": "Selected-tab context, compaction, subagent and process status for Hermes Desktop",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --experimental-vm-modules --test",
+    "check": "node --check plugin.js && node --experimental-vm-modules --test"
+  }
+}

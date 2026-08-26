@@ -1,0 +1,75 @@
+{
+  "runtime": "python -m tui_gateway.entry",
+  "checks": [
+    {
+      "name": "gateway reachable (session.create)",
+      "ok": true,
+      "detail": "session_id=e441dde8"
+    },
+    {
+      "name": "delegation.async_status is absent",
+      "ok": true,
+      "detail": "rejected: unknown method: delegation.async_status"
+    },
+    {
+      "name": "delegation.status exists but is global",
+      "ok": true,
+      "detail": "keys=active,paused,max_spawn_depth,max_concurrent_children"
+    },
+    {
+      "name": "delegation.status strips owner_session_id",
+      "ok": true,
+      "detail": "cannot scope to a tab"
+    },
+    {
+      "name": "config.get key=full works",
+      "ok": true,
+      "detail": "compression keys: enabled,threshold,threshold_tokens,target_ratio,protect_last_n,protect_first_n"
+    },
+    {
+      "name": "live config uses `threshold` not `threshold_percent`",
+      "ok": true,
+      "detail": "threshold=0.9"
+    },
+    {
+      "name": "deriveThreshold on LIVE config",
+      "ok": true,
+      "detail": "→ 200000"
+    },
+    {
+      "name": "process.list is session-scoped",
+      "ok": true,
+      "detail": "0 process(es)"
+    },
+    {
+      "name": "session.usage works",
+      "ok": true,
+      "detail": "keys=model,input,output,reasoning,prompt,completion,total,calls,compressions,active_subagents"
+    },
+    {
+      "name": "session.usage exposes NO threshold field",
+      "ok": true,
+      "detail": "threshold must be derived from config"
+    },
+    {
+      "name": "loadSessionPulse end-to-end",
+      "ok": true,
+      "detail": "{\"activeTokens\":null,\"thresholdTokens\":null,\"maxTokens\":null,\"compactions\":0,\"subagents\":null,\"processes\":0}"
+    },
+    {
+      "name": "formatPulseLine end-to-end",
+      "ok": true,
+      "detail": "— / — / — · C0 · A— · P0"
+    },
+    {
+      "name": "thresholdState end-to-end",
+      "ok": true,
+      "detail": "unknown"
+    },
+    {
+      "name": "accessibleLabel end-to-end",
+      "ok": true,
+      "detail": "Context in use: unknown tokens. compaction expected at: unknown tokens. model limit: unknown tokens. compactions so far: 0. active subagents: unknown. active processes: 0."
+    }
+  ]
+}
