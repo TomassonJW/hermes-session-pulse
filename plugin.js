@@ -1,8 +1,8 @@
 import {
   cn,
+  COMPOSER_AREAS,
   host,
   queryClient,
-  STATUSBAR_AREAS,
   Tip,
   useQuery,
   useValue
@@ -33,15 +33,23 @@ const runningProcessCount = payload => {
 // counter too. So we track identities per session ourselves.
 //
 // The gateway emits NO `session.closed` event (it emits session.info /
-// session.usage), so there is no eviction signal to subscribe to. The map is
-// therefore self-bounding: least-recently-touched sessions are dropped past a
-// cap. An evicted session reports unknown (`—`) again, never a false zero.
+// session.usage; `session.reclaimed` only covers idle/LRU reclamation), so
+// there is no eviction signal to subscribe to. The map is therefore
+// self-bounding: least-recently-touched sessions are dropped past a cap.
+//
+// Crucially, an event history is only a CENSUS once we know it started from
+// nothing. The plugin can load or hot-reload while children are already
+// running, and a late-arriving `subagent.tool` for an unseen child would
+// otherwise read as "1" while others run unobserved. So counts stay unknown
+// until a reliable global zero establishes a baseline.
 const DEFAULT_MAX_TRACKED_SESSIONS = 64
 
 export function createSubagentTracker({ maxSessions = DEFAULT_MAX_TRACKED_SESSIONS } = {}) {
   // Map preserves insertion order; re-inserting on touch makes it an LRU.
   const bySession = new Map()
   let globalActive = null
+  // True once a reliable global zero proved nothing was running anywhere.
+  let hasBaseline = false
 
   const touch = sessionId => {
     const live = bySession.get(sessionId)
@@ -77,82 +85,62 @@ export function createSubagentTracker({ maxSessions = DEFAULT_MAX_TRACKED_SESSIO
     observe,
     observeGlobalActive: value => {
       globalActive = finiteOrNull(value)
+      if (globalActive === 0) {
+        // Authoritative: nothing is running in ANY session. This both
+        // establishes the baseline and clears stale positives left behind by a
+        // dropped completion event.
+        hasBaseline = true
+        bySession.clear()
+      }
     },
     forget: sessionId => {
       bySession.delete(sessionId)
     },
     trackedSessionCount: () => bySession.size,
+    hasReliableBaseline: () => hasBaseline,
     countFor: sessionId => {
+      // Without a proven starting point our record may be incomplete, so any
+      // number we could produce would be a guess presented as fact.
+      if (!hasBaseline) return null
       const live = sessionId ? touch(sessionId) : undefined
-      if (live !== undefined) return live.size
-      // Never observed (or since evicted). A trustworthy global zero still
-      // proves the focused tab has none; any non-zero global tells us nothing
-      // about which tab owns it, so stay honestly unknown.
-      return globalActive === 0 ? 0 : null
+      // Post-baseline, an unseen tab genuinely has none: we would have seen a
+      // start event for it.
+      return live === undefined ? 0 : live.size
     }
   }
 }
 
-// The compaction threshold lives on `agent.context_compressor` and is not
-// serialised by any plugin-reachable RPC, so we mirror the runtime's own
-// resolution from config — a side-effect-free read, unlike `/context`, which
-// dispatches to a worker for an ordinary local session.
+// The compaction threshold CANNOT be honestly derived. It lives on
+// `agent.context_compressor` and is serialised by no plugin-reachable read,
+// and the runtime's resolution (agent/context_compressor.py) needs inputs no
+// plugin can see:
 //
-// Key names and default follow agent_init.py:
-//   float(compression.get("threshold", 0.50))
-// It is `threshold`, not `threshold_percent`, and the fallback is 0.50.
-const RUNTIME_DEFAULT_THRESHOLD = 0.5
-
-const asFraction = value => {
-  const number = finiteOrNull(value)
-  if (number === null || number <= 0) return null
-  // Config accepts both 0.75 and 75.
-  const fraction = number > 1 ? number / 100 : number
-  return fraction > 0 && fraction <= 1 ? fraction : null
-}
-
-// Mirrors resolve_model_threshold: substring match on the model name, longest
-// key wins.
-const modelThresholdFraction = (modelThresholds, model) => {
-  if (!modelThresholds || typeof modelThresholds !== 'object') return null
-  const name = String(model || '')
-  if (!name) return null
-  let bestKey = null
-  for (const key of Object.keys(modelThresholds)) {
-    if (!key || !name.includes(key)) continue
-    if (bestKey === null || key.length > bestKey.length) bestKey = key
-  }
-  return bestKey === null ? null : asFraction(modelThresholds[bestKey])
-}
-
-// Mirrors agent_init.py: str(compression.get("enabled", True)).lower() in
-// {"true","1","yes"} — enabled unless explicitly turned off.
-const compressionEnabled = compression => {
-  const raw = compression?.enabled
-  if (raw === undefined || raw === null) return true
-  return ['true', '1', 'yes'].includes(String(raw).toLowerCase())
-}
-
-export function deriveThreshold({ config, contextMax, model }) {
+//   1. threshold_percent = config `threshold`, then a per-model override, then
+//      RAISED to 0.75 for ANY window below 512_000 (_effective_threshold_percent
+//      — so a 128K model does NOT keep a configured 0.50);
+//   2. the percentage applies to `context_length - max_tokens`, the provider's
+//      output reservation, which no RPC exposes;
+//   3. the result is floored at MINIMUM_CONTEXT_LENGTH with an 85%
+//      degenerate-window fallback;
+//   4. `threshold_tokens` is applied as a CAP via min(), not as a winner
+//      (_apply_threshold_tokens_cap);
+//   5. provider autoraises and external context engines can override all of it.
+//
+// Reproducing that from `config.get` produces a confident wrong number, which
+// is worse than admitting ignorance. So we only report a threshold the runtime
+// itself hands us, and otherwise render unknown. See issue: exposing the
+// compressor's effective threshold_tokens on session.usage would fix this.
+export function readReportedThreshold({ usage, contextMax }) {
+  const reported = finiteOrNull(
+    usage?.context_threshold ??
+      usage?.threshold_tokens ??
+      usage?.compaction_threshold
+  )
+  if (!reported) return null
   const max = finiteOrNull(contextMax)
-  if (!max) return null
-
-  const compression = config?.compression
-  // A disabled compressor never auto-compacts, so there is no compaction point
-  // to announce. Showing one would be a fabricated expectation.
-  if (!compressionEnabled(compression)) return null
-
-  const clamp = value => Math.min(max, value)
-
-  const absolute = finiteOrNull(compression?.threshold_tokens)
-  if (absolute) return clamp(absolute)
-
-  const fraction =
-    modelThresholdFraction(compression?.model_thresholds, model) ??
-    asFraction(compression?.threshold) ??
-    RUNTIME_DEFAULT_THRESHOLD
-
-  return clamp(Math.round(max * fraction))
+  // A threshold beyond the window can never be reached; clamp so the display
+  // stays coherent.
+  return max ? Math.min(max, reported) : reported
 }
 
 const UNKNOWN = '—'
@@ -215,23 +203,20 @@ const EMPTY_SNAPSHOT = {
 
 // `subagents` is supplied by the caller's event-stream tracker, not fetched:
 // every subagent RPC on the gateway is global, and a global count attributed to
-// one tab would be a lie.
+// one tab would be a lie. The threshold likewise comes only from what the
+// runtime reports — never from a config-derived guess.
 export async function loadSessionPulse({ request, sessionId, usage, subagents = null }) {
   if (!sessionId) return { ...EMPTY_SNAPSHOT }
 
-  const [processResult, configResult] = await Promise.allSettled([
-    request('process.list', { session_id: sessionId }),
-    request('config.get', { key: 'full' })
+  const [processResult] = await Promise.allSettled([
+    request('process.list', { session_id: sessionId })
   ])
 
   const maxTokens = finiteOrNull(usage?.context_max)
-  const config = configResult.status === 'fulfilled' ? configResult.value?.config : null
 
   return {
     activeTokens: finiteOrNull(usage?.context_used),
-    thresholdTokens: config
-      ? deriveThreshold({ config, contextMax: maxTokens, model: usage?.model })
-      : null,
+    thresholdTokens: readReportedThreshold({ usage, contextMax: maxTokens }),
     maxTokens,
     compactions: finiteOrNull(usage?.compressions),
     subagents: finiteOrNull(subagents),
@@ -270,6 +255,9 @@ function SessionPulseChip({ tracker }) {
     queryKey: [
       PLUGIN_ID,
       sessionId,
+      // The model affects any threshold the runtime reports, so a model switch
+      // must not serve the previous model's number.
+      usage?.model ?? null,
       usage?.context_used ?? null,
       usage?.context_max ?? null,
       usage?.compressions ?? null,
@@ -334,7 +322,10 @@ export default {
 
     ctx.register({
       id: 'pulse',
-      area: STATUSBAR_AREAS.right,
+      // The UI contract asks for a thin strip under the composer.
+      // COMPOSER_AREAS.underside is 'composer.underside' — a floating strip
+      // below the whole composer, with no chrome of its own.
+      area: COMPOSER_AREAS.underside,
       order: 114,
       render: () => jsx(SessionPulseChip, { tracker })
     })

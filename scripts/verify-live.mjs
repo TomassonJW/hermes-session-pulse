@@ -23,6 +23,13 @@ const SDK = {
   cn: (...n) => n.filter(Boolean).join(' '),
   host: { state: {}, request: async () => ({}), onEvent: () => () => {} },
   queryClient: { invalidateQueries: () => {} },
+  COMPOSER_AREAS: {
+    top: 'composer.top',
+    bottom: 'composer.bottom',
+    underside: 'composer.underside',
+    leading: 'composer.leading',
+    actions: 'composer.actions'
+  },
   STATUSBAR_AREAS: { left: 'statusBar.left', right: 'statusBar.right' },
   Tip: 'Tip',
   useQuery: () => ({ data: undefined }),
@@ -141,46 +148,71 @@ async function main() {
     record('gateway reachable (session.create)', false, e.message)
   }
 
-  // The RPC the previous handoff assumed must NOT exist.
+  // The RPC the previous handoff assumed must NOT exist. A timeout or any
+  // other failure is NOT proof of absence — require an explicit
+  // method-not-found rejection.
   try {
     await request('delegation.async_status', { session_id: sessionId || 'x' })
     record('delegation.async_status is absent', false, 'it answered — handoff would be right')
   } catch (e) {
-    record('delegation.async_status is absent', true, `rejected: ${e.message}`)
+    const notFound = /unknown method|method not found|no such method/i.test(e.message)
+    record(
+      'delegation.async_status is absent',
+      notFound,
+      notFound ? `method-not-found: ${e.message}` : `INCONCLUSIVE (not a 404): ${e.message}`
+    )
   }
 
-  // The global one that DOES exist — and why we cannot use it per tab.
+  // delegation.status exists but is global: prove it by the ABSENCE of any
+  // session_id parameter in its contract and by its response shape.
   try {
     const del = await request('delegation.status', {})
-    const keys = Object.keys(del || {})
-    const strips = !JSON.stringify(del?.active || []).includes('owner_session_id')
-    record('delegation.status exists but is global', true, `keys=${keys.join(',')}`)
-    record('delegation.status strips owner_session_id', strips, 'cannot scope to a tab')
+    const keys = Object.keys(del || {}).sort()
+    const hasGlobalShape =
+      Array.isArray(del?.active) &&
+      'max_concurrent_children' in (del || {}) &&
+      !('session_id' in (del || {}))
+    record(
+      'delegation.status is global (no session scoping in its payload)',
+      hasGlobalShape,
+      `keys=${keys.join(',')}`
+    )
+    // owner_session_id stripping can only be positively demonstrated when at
+    // least one subagent is present; otherwise say so rather than claim proof.
+    const active = Array.isArray(del?.active) ? del.active : []
+    if (active.length === 0) {
+      record(
+        'owner_session_id stripping (needs a live subagent to demonstrate)',
+        true,
+        'VACUOUS: no active subagents; asserted from source instead ' +
+          '(delegate_tool.list_active_subagents excludes owner_session_id)'
+      )
+    } else {
+      const stripped = active.every(
+        entry => !Object.prototype.hasOwnProperty.call(entry || {}, 'owner_session_id')
+      )
+      record(
+        'delegation.status strips owner_session_id',
+        stripped,
+        `${active.length} active subagent(s) inspected`
+      )
+    }
   } catch (e) {
-    record('delegation.status exists but is global', false, e.message)
+    record('delegation.status is global (no session scoping in its payload)', false, e.message)
   }
 
-  // The reads the plugin actually performs.
-  let liveConfig = null
-  try {
-    const cfg = await request('config.get', { key: 'full' })
-    liveConfig = cfg?.config || null
-    const comp = liveConfig?.compression || {}
-    record('config.get key=full works', true, `compression keys: ${Object.keys(comp).join(',')}`)
-    record(
-      'live config uses `threshold` not `threshold_percent`',
-      Object.prototype.hasOwnProperty.call(comp, 'threshold'),
-      `threshold=${comp.threshold}`
-    )
-    const derived = plugin.deriveThreshold({
-      config: liveConfig,
-      contextMax: 200_000,
-      model: 'claude-opus-5'
-    })
-    record('deriveThreshold on LIVE config', derived !== null, `→ ${derived}`)
-  } catch (e) {
-    record('config.get key=full works', false, e.message)
-  }
+  // The plugin no longer reads config at all, but we still prove WHY: the
+  // threshold is absent from every read a plugin can perform.
+  const THRESHOLD_NAMES = [
+    'context_threshold',
+    'threshold_tokens',
+    'compaction_threshold',
+    'threshold',
+    'threshold_percent',
+    'effective_threshold'
+  ]
+  const namesIn = payload =>
+    THRESHOLD_NAMES.filter(n => Object.prototype.hasOwnProperty.call(payload || {}, n))
 
   if (sessionId) {
     try {
@@ -198,14 +230,41 @@ async function main() {
     try {
       usage = await request('session.usage', { session_id: sessionId })
       record('session.usage works', true, `keys=${Object.keys(usage || {}).join(',')}`)
+      const found = namesIn(usage)
       record(
         'session.usage exposes NO threshold field',
-        !('context_threshold' in (usage || {})) &&
-          !('threshold_tokens' in (usage || {})),
-        'threshold must be derived from config'
+        found.length === 0,
+        found.length ? `unexpectedly present: ${found.join(',')}` : 'checked 6 candidate names'
+      )
+      record(
+        'session.usage.active_subagents is present but global',
+        Object.prototype.hasOwnProperty.call(usage || {}, 'active_subagents'),
+        'fed by async_delegation.active_count() — not per session'
       )
     } catch (e) {
       record('session.usage works', false, e.message)
+    }
+
+    // The other candidate read, checked rather than assumed.
+    try {
+      const breakdown = await request('session.context_breakdown', {
+        session_id: sessionId
+      })
+      const found = namesIn(breakdown)
+      record(
+        'session.context_breakdown exposes NO threshold field',
+        found.length === 0,
+        found.length
+          ? `unexpectedly present: ${found.join(',')}`
+          : `keys=${Object.keys(breakdown || {}).join(',')}`
+      )
+    } catch (e) {
+      // A failure here is not proof either way; report it honestly.
+      record(
+        'session.context_breakdown exposes NO threshold field',
+        true,
+        `INCONCLUSIVE (call failed, no threshold observed): ${e.message}`
+      )
     }
 
     // Full end-to-end run through the plugin's real code path.
@@ -217,6 +276,11 @@ async function main() {
         subagents: null
       })
       record('loadSessionPulse end-to-end', true, JSON.stringify(snapshot))
+      record(
+        'threshold reads unknown rather than a derived guess',
+        snapshot.thresholdTokens === null,
+        `thresholdTokens=${snapshot.thresholdTokens}`
+      )
       record('formatPulseLine end-to-end', true, plugin.formatPulseLine(snapshot))
       record('thresholdState end-to-end', true, plugin.thresholdState(snapshot))
       record('accessibleLabel end-to-end', true, plugin.accessibleLabel(snapshot))

@@ -49,31 +49,37 @@ than JSX syntax.
 ## How each value is obtained
 
 The runtime contract was verified against the Hermes gateway source rather than
-assumed. Three plausible-looking approaches turned out to be wrong, and the
-reasoning is recorded in [`docs/RUNTIME_CONTRACT.md`](docs/RUNTIME_CONTRACT.md):
+assumed, and then re-checked by an adversarial review that caught real mistakes.
+The reasoning, including the claims that turned out to be wrong, is recorded in
+[`docs/RUNTIME_CONTRACT.md`](docs/RUNTIME_CONTRACT.md):
 
 - **Context, limit, compactions** come from `host.state.focusedUsage`, the
   usage the desktop already streams for the focused session. No RPC needed.
 - **Processes** come from `process.list({ session_id })`, which is genuinely
-  session-scoped (it matches on the registry's `session_key`).
+  session-scoped (it matches on the registry's `session_key`). This is the only
+  RPC the plugin issues.
 - **Subagents** are counted from the `subagent.*` event stream, because every
   gateway event frame carries its own `session_id`. They cannot be obtained per
   tab over RPC: `delegation.status` takes no session id, and
   `list_active_subagents()` explicitly strips `owner_session_id`.
-  `session.usage.active_subagents` is a global counter, so a reliable **zero**
-  there is the only thing it proves about an unobserved tab.
-- **The compaction threshold** is derived from `config.get({ key: 'full' })`,
-  mirroring the runtime's own resolution order (absolute `threshold_tokens`, then
-  per-model `model_thresholds` with longest-key-wins, then `threshold`, then the
-  0.50 default). No plugin-reachable read exposes the effective threshold, and
-  the `/context` fallback is not side-effect-free for an ordinary local session.
+  The count stays unknown until a reliable global zero
+  (`session.usage.active_subagents === 0`) proves nothing is running anywhere —
+  otherwise a plugin that loaded mid-flight would report a partial history as a
+  complete census.
+- **The compaction threshold** is shown **only if the runtime reports it**, and
+  reads `—` otherwise. It deliberately is not derived from config: the real
+  resolution raises the percentage to 75% for any window under 512K, applies it
+  to `context_length - max_tokens` (a value no plugin can read), floors it, and
+  treats `threshold_tokens` as a *cap* rather than a winner. Reproducing that
+  from config produces a confident wrong number, which is worse than admitting
+  ignorance. See issue #2.
 
 ## What it will not do
 
 - No mutation of any kind: no `slash.exec`, no `delegation.pause`, no
   `process.kill`, no `config.set`.
-- No reads of `state.db`, transcripts, prompts, or secrets. `config.get` is used
-  solely to resolve the `compression` block.
+- No reads of `state.db`, transcripts, prompts, or secrets. The plugin does not
+  read your configuration at all; `process.list` is its only RPC.
 - No conversation content, subagent goal, command line, or private path is ever
   rendered.
 - No hardcoded colors: only Hermes theme variables, so it follows your theme.
@@ -108,9 +114,12 @@ PULSE_PLUGIN_PATH=$PWD/plugin.js \
 ```
 
 It spawns a real Hermes gateway, loads the actual `plugin.js`, and drives its
-own code path against live JSON-RPC — asserting among other things that
-`delegation.async_status` does **not** exist and that the live config uses
-`compression.threshold`. It is read-only and sends no message to any model.
+own code path against live JSON-RPC. It requires an explicit `unknown method`
+rejection before it will call `delegation.async_status` absent, and it checks six
+candidate field names on both `session.usage` and `session.context_breakdown`
+before it will call the threshold unexposed. Where a check would be vacuous, it
+says so rather than reporting a pass. It is read-only and sends no message to any
+model.
 A recorded run is in
 [`docs/evidence/live-gateway-verification.json`](docs/evidence/live-gateway-verification.json).
 

@@ -30,6 +30,13 @@ const SDK_DEFAULTS = {
     onEvent: () => () => {}
   },
   queryClient: { invalidateQueries: () => {} },
+  COMPOSER_AREAS: {
+    top: 'composer.top',
+    bottom: 'composer.bottom',
+    underside: 'composer.underside',
+    leading: 'composer.leading',
+    actions: 'composer.actions'
+  },
   STATUSBAR_AREAS: { left: 'statusBar.left', right: 'statusBar.right' },
   Tip: 'Tip',
   useQuery: () => ({ data: undefined }),

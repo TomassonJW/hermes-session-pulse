@@ -35,56 +35,58 @@ Renfort utile : lorsque le compteur global `active_subagents` vaut 0, aucune
 session ne peut en avoir, donc 0 est vrai pour l'onglet focalisé. C'est la seule
 inférence sûre que le compteur global autorise.
 
-### 2. `COMPOSER_AREAS.underside` n'existe pas
+### 2. `COMPOSER_AREAS.underside` existe bel et bien
 
-Les zones réelles du composeur sont `top`, `bottom`, `leading`, `actions`,
-`attachments`, `middleware`. Il n'y a pas de `underside`.
+**Cette section corrigeait à tort le handoff. Le handoff avait raison.**
 
-Décision : `statusBar.right`, cohérent avec le précédent `session-tokens` déjà
-installé, qui est un chip de statut de la même nature. La bande sous le composeur
-décrite dans `UI_CONTRACT.md` n'est pas réalisable sans modifier le Desktop, ce
-que le contrat interdit.
+`COMPOSER_AREAS` expose `underside: 'composer.underside'`
+(`apps/desktop/src/app/chat/composer/contrib.ts`), décrit dans le source comme
+« floating strip BELOW the whole composer (no chrome) ». La constante est bien
+réexportée aux plugins par `apps/desktop/src/sdk/index.ts`.
 
-### 3. Le seuil de compaction n'est exposé par aucune lecture accessible
+Une première version de ce document affirmait le contraire et plaçait le
+composant sur `statusBar.right`. C'était faux : la conclusion venait d'une liste
+partielle citée dans la documentation SDK, pas du source. Le composant est
+maintenant sur `COMPOSER_AREAS.underside`, ce que `UI_CONTRACT.md` demandait
+depuis le début.
 
-`threshold_tokens` et `threshold_percent` vivent sur `agent.context_compressor`
-et ne sont sérialisés ni par `session.usage`, ni par
-`session.context_breakdown`, ni par `delegation.status`.
+Zones réelles : `top`, `bottom`, `underside`, `leading`, `actions`,
+`middleware`, `attachments`, `microActions`, `atCompletions`.
 
-Le repli `/context` prévu par le handoff ne fonctionne pas non plus :
-`_live_slash_command_output` ne sert `context` que si
-`_session_uses_compute_host(session)` est vrai (`tui_gateway/server.py:14803`).
-Pour une session locale ordinaire, `slash.exec /context` part au worker, ce qui
-est une exécution réelle et non une lecture sans effet de bord. Le handoff
-demandait explicitement une lecture sans mutation : ce chemin est donc écarté.
+Leçon : une énumération dans un document n'est pas le contrat. Seul le source
+l'est.
 
-Décision : dériver le seuil de la configuration, qui est lisible sans effet de
-bord via `config.get({ key: 'full' })`, en reproduisant la résolution du runtime :
+### 3. Le seuil de compaction n'est pas dérivable
 
-1. `compression.threshold_tokens` s'il est défini — plafond absolu ;
-2. sinon `compression.model_thresholds`, correspondance par sous-chaîne sur le
-   nom du modèle, la clé la plus longue gagnant (`resolve_model_threshold`,
-   `agent/context_compressor.py:2045`) ;
-3. sinon `compression.threshold` ;
-4. sinon 0,50.
+Aucune lecture accessible au plugin ne l'expose. Vérifié en live : ni
+`session.usage` ni `session.context_breakdown` ne contiennent l'un des six noms
+candidats.
 
-Les noms de clés et la valeur par défaut viennent de `agent/agent_init.py:2101` :
-`float(_compression_cfg.get("threshold", 0.50))`.
+Le repli `/context` est écarté : `_live_slash_command_output` ne sert `context`
+directement que si `_session_uses_compute_host(session)` est vrai, sinon la
+commande partait au worker. Lire une jauge ne doit pas exécuter une commande.
 
-Piège vérifié sur la configuration réelle du profil actif : la clé est bien
-`threshold` et non `threshold_percent`, et le défaut est 0,50 et non 0,75. Une
-première implémentation lisait `threshold_percent` avec un défaut de 0,75 ; elle
-retournait donc silencieusement une valeur fausse sur la configuration réellement
-installée. Le test `the live configuration shape resolves to its absolute
-ceiling` rejoue le bloc `compression` exact trouvé dans `config.yaml`.
+**Et la dérivation depuis la configuration est également écartée.** Une première
+version reproduisait `compression.threshold` avec défaut 0,50 et présentait le
+résultat comme le seuil. C'était un nombre faux affiché avec assurance, car la
+résolution réelle (`agent/context_compressor.py`) fait davantage :
 
-La fraction est multipliée par `context_max`. Sans `context_max`, le seuil reste
-inconnu.
+1. le pourcentage est **relevé à 0,75 pour toute fenêtre inférieure à 512 000**
+   (`_effective_threshold_percent`) : un modèle 128k ne garde donc pas un 0,50
+   configuré, contrairement à ce que ce document affirmait ;
+2. le pourcentage s'applique à `context_length - max_tokens`, la réservation de
+   sortie du provider, qu'aucune RPC n'expose ;
+3. le résultat est planchéisé à `MINIMUM_CONTEXT_LENGTH`, avec un repli à 85 %
+   pour les fenêtres dégénérées ;
+4. `threshold_tokens` est appliqué comme **plafond** via `min()`
+   (`_apply_threshold_tokens_cap`), pas comme vainqueur absolu ;
+5. des relèvements par provider et les moteurs de contexte externes peuvent
+   encore tout remplacer.
 
-Limite assumée : le runtime applique un plancher pour les très petites fenêtres
-de contexte, que cette dérivation ne reproduit pas. Le seuil est donc présenté
-comme dérivé, et le panneau de détail le dit en français courant. Pour les
-modèles de 128k et plus, le plancher ne s'applique pas.
+Une entrée manquante (`max_tokens`) suffit à rendre le calcul non reproductible.
+Le plugin ne lit donc plus la configuration du tout : il n'affiche que le seuil
+que le runtime lui donne, et `—` sinon. C'est la seule réponse honnête, et elle
+respecte l'invariant du projet.
 
 ## Lectures retenues
 
@@ -92,11 +94,24 @@ modèles de 128k et plus, le plancher ne s'applique pas.
 |---|---|---|
 | Contexte actif, maximum, compactions | `host.state.focusedUsage` | oui, natif |
 | Processus | `process.list({session_id})` | oui, `session_key` |
-| Sous-agents | flux `subagent.*` + zéro global | oui, par événement |
-| Seuil | `config.get({key:'full'})` + `context_max` | dérivé |
+| Sous-agents | flux `subagent.*`, après baseline | oui, par événement |
+| Seuil | uniquement si le runtime le rapporte | sinon `—` |
 
 `host.state.focusedUsage` évite tout RPC pour les tokens : le Desktop diffuse
-déjà l'usage de la session focalisée.
+déjà l'usage de la session focalisée. `process.list` est la seule RPC émise.
+
+## Baseline du comptage de sous-agents
+
+Un historique d'événements n'est un recensement que si l'on sait qu'il a commencé
+à zéro. Le plugin peut être chargé ou rechargé à chaud alors que des sous-agents
+tournent déjà : un `subagent.tool` tardif pour un enfant jamais vu afficherait
+alors `A1` alors que d'autres tournent sans être observés, et un
+`subagent.complete` isolé produirait un `A0` mensonger.
+
+Le comptage reste donc **inconnu** jusqu'à ce qu'un zéro global fiable
+(`session.usage.active_subagents === 0`) prouve qu'aucun sous-agent ne tourne
+nulle part. Ce zéro établit la baseline et, à chaque nouvelle occurrence, purge
+les positifs périmés qu'un événement de fin perdu aurait laissés.
 
 ## Identité d'onglet
 
@@ -114,37 +129,69 @@ utilisé.
 
 ## Défauts trouvés par revue hostile indépendante
 
-Une revue adverse en lecture seule a été passée sur le plugin après la première
-version verte. Elle a trouvé deux défauts réels, corrigés en TDD.
+Une revue adverse en lecture seule a rendu un verdict **BLOCK** avec 12
+constats. Elle avait raison sur les points matériels, y compris contre ce
+document. Tous corrigés en TDD avec RED observé.
 
 ### Fuite entre onglets par `placeholderData` (critique)
 
 `useQuery` était configuré avec `placeholderData: previous => previous`. React
 Query sert alors le dernier résultat observé pendant le chargement de la nouvelle
 clé : au changement d'onglet, les chiffres de l'onglet précédent s'affichaient
-sous le nouvel onglet jusqu'à la fin de ses propres lectures. C'était exactement
-la fuite que ce plugin existe pour éviter.
+sous le nouvel onglet. C'était exactement la fuite que ce plugin existe pour
+éviter.
 
 Corrigé en retirant `placeholderData`. Un onglet en cours de chargement affiche
-`—`, ce qui est honnête et conserve la mise en page. Les tests de
-`tests/focus-isolation.test.mjs` invoquent le composant réel et échouent si
-`placeholderData` est réintroduit.
+`—`. `tests/focus-isolation.test.mjs` invoque le composant réel et échoue si on
+le réintroduit (vérifié en le remettant).
 
-### Seuil affiché alors que la compaction est désactivée (élevé)
+### Seuil faux affiché avec assurance (élevé)
 
-`compression.enabled: false` signifie que le runtime ne compacte jamais
-automatiquement. Le seuil était pourtant calculé et affiché, ce qui annonçait une
-compaction qui n'arriverait pas. `deriveThreshold` retourne désormais `null` dans
-ce cas, en reproduisant la lecture du runtime
-(`str(compression.get("enabled", True)).lower() in {"true","1","yes"}`).
+Voir la section 3 ci-dessus. La dérivation depuis la configuration ne reproduit
+ni le plancher 512k, ni la soustraction de `max_tokens`, ni la sémantique de
+plafond de `threshold_tokens`. Elle est supprimée : le plugin n'affiche que ce
+que le runtime rapporte.
+
+### Comptage de sous-agents sans baseline (élevé)
+
+Un historique partiel était présenté comme un recensement, et un
+`subagent.complete` isolé produisait un faux `A0`. Voir la section baseline.
+
+### Zéro global n'écrasait pas un positif périmé (élevé)
+
+`countFor()` retournait la taille du `Set` avant de consulter le compteur
+global ; un événement de fin perdu laissait donc `A1` affiché alors que le
+compteur autoritaire disait zéro. Le zéro global purge maintenant tout.
+
+### Modèle absent de la clé de requête (moyen)
+
+Un changement de modèle qui laissait contexte et compactions identiques servait
+l'ancienne valeur. `usage.model` fait désormais partie de la clé.
+
+### Harnais de vérification complaisant (moyen)
+
+Le harnais comptait comme preuve des affirmations non prouvées : n'importe quel
+rejet, timeout inclus, validait « méthode absente » ; « global » était codé en
+dur ; l'absence de `owner_session_id` dans un tableau vide ne prouvait rien ;
+`session.context_breakdown` n'était jamais appelé. Corrigé : exigence d'une
+erreur `unknown method` explicite, vérification de forme du payload, six noms
+candidats testés sur les deux lectures, et marquage explicite `VACUOUS` quand
+une preuve serait vide.
 
 ### Fuite mémoire du suivi de sous-agents
 
-Trouvée en vérifiant une hypothèse avant la revue : le code s'abonnait à
-`session.closed` pour oublier un onglet fermé. Cet événement **n'existe pas** ; le
-gateway émet `session.info` et `session.usage`. Le `Map` grossissait donc d'une
-entrée par session vue. Le suivi est maintenant borné par LRU, et un onglet évincé
-redevient inconnu (`—`) au lieu de retourner un faux zéro.
+Trouvée avant la revue : le code s'abonnait à `session.closed`, qui **n'existe
+pas** (le gateway émet `session.info`, `session.usage`, et `session.reclaimed`
+seulement pour la récupération de sessions inactives). Le `Map` grossissait d'une
+entrée par session vue. Le suivi est borné par LRU.
 
-Au passage, ce correctif a supprimé un bug latent : `if (live)` traitait un `Set`
-vide comme faux, donc un onglet à zéro vérifié retombait sur l'inférence globale.
+## Points restants, non corrigés
+
+- **Routage par propriétaire d'onglet.** Le SDK expose
+  `host.state.focusedSessionOwner` et `host.requestProfile(owner, ...)` parce que
+  le focus d'une tuile peut changer sans changer le gateway actif. Le plugin
+  utilise `host.request`, qui cible le socket du profil actif. Avec plusieurs
+  profils ou connexions, la tuile focalisée peut appartenir à un autre
+  propriétaire. Le suivi n'est pas non plus indexé par `(connectionId, profile,
+  sessionId)`. Non corrigé : à traiter avec une vérification réelle multi-profils,
+  pas à l'aveugle.

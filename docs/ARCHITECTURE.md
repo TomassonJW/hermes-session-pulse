@@ -27,17 +27,21 @@ les corrections apportées aux hypothèses initiales sont dans
 
 - contexte actif, maximum, compactions : `host.state.focusedUsage`, l'usage
   diffusé de la session focalisée, sans aucune RPC ;
-- processus : `process.list({ session_id })`, session-scopé par `session_key` ;
+- processus : `process.list({ session_id })`, session-scopé par `session_key`.
+  C'est la seule RPC émise par le plugin ;
 - sous-agents : flux d'événements `subagent.*`, session-scopé par construction.
   Aucune RPC de délégation n'est utilisable ici : `delegation.status` est globale
-  et `list_active_subagents()` retire `owner_session_id`. Un zéro global fiable
-  reste la seule inférence autorisée pour un onglet jamais observé ;
-- seuil de compaction : dérivé de `config.get({ key: 'full' })`, en reproduisant
-  la résolution du runtime. Aucune lecture accessible au plugin ne l'expose.
+  et `list_active_subagents()` retire `owner_session_id`. Le comptage reste
+  inconnu jusqu'à ce qu'un zéro global fiable prouve que rien ne tourne nulle
+  part, sinon un historique partiel serait présenté comme un recensement ;
+- seuil de compaction : affiché **uniquement** si le runtime le rapporte. Il
+  n'est pas dérivé de la configuration, car la résolution réelle dépend d'entrées
+  qu'aucun plugin ne peut lire.
 
 ## Absence de source
 
 Si Hermes ne publie pas une donnée requise, elle est affichée `—`. Un zéro n'est
 montré qu'après une réponse fiable et vide. Aucun accès direct à un secret, à
-`state.db` ou au contenu de conversation n'est autorisé, et aucune écriture n'est
-effectuée : ni `slash.exec`, ni `delegation.pause`, ni `process.kill`.
+`state.db` ou au contenu de conversation n'est autorisé, aucune lecture de la
+configuration n'est effectuée, et aucune écriture n'a lieu : ni `slash.exec`, ni
+`delegation.pause`, ni `process.kill`.

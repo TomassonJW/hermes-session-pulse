@@ -3,201 +3,111 @@ import test from 'node:test'
 
 import { loadPlugin } from './helpers/load-plugin.mjs'
 
-test('an absolute threshold_tokens ceiling wins over any percentage', async () => {
+/**
+ * The compaction threshold CANNOT be derived from config.
+ *
+ * Verified in agent/context_compressor.py, the runtime resolves it as:
+ *   1. threshold_percent = config `threshold`, then per-model override,
+ *      then RAISED to 0.75 for any window < 512_000 (_effective_threshold_percent);
+ *   2. effective_window = context_length - max_tokens  (the provider's output
+ *      reservation, which no plugin-reachable read exposes);
+ *   3. tokens = effective_window * threshold_percent, floored at
+ *      MINIMUM_CONTEXT_LENGTH, with an 85% degenerate-window fallback;
+ *   4. threshold_tokens is applied as a CAP via min(), not as a winner
+ *      (_apply_threshold_tokens_cap).
+ *
+ * Reproducing that from `config.get` alone yields a wrong number, so the
+ * honest answer is unknown until the runtime exposes the effective value.
+ */
+
+test('the threshold is unknown even when the config is fully readable', async () => {
   const plugin = await loadPlugin()
 
-  const threshold = plugin.deriveThreshold({
-    config: { compression: { threshold_tokens: 90_000, threshold: 0.5 } },
-    contextMax: 128_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 90_000)
-})
-
-test('a per-model threshold overrides the default percentage', async () => {
-  const plugin = await loadPlugin()
-
-  const threshold = plugin.deriveThreshold({
-    config: {
-      compression: {
-        threshold: 0.75,
-        model_thresholds: { 'claude-opus': 0.5 }
-      }
-    },
-    contextMax: 128_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 64_000)
-})
-
-test('the longest matching model key wins, mirroring resolve_model_threshold', async () => {
-  const plugin = await loadPlugin()
-
-  const threshold = plugin.deriveThreshold({
-    config: {
-      compression: {
-        model_thresholds: { claude: 0.5, 'claude-opus-5': 0.25 }
-      }
-    },
-    contextMax: 128_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 32_000)
-})
-
-test('the configured default percentage applies when no model key matches', async () => {
-  const plugin = await loadPlugin()
-
-  const threshold = plugin.deriveThreshold({
-    config: {
-      compression: { threshold: 0.6, model_thresholds: { 'gpt-5': 0.5 } }
-    },
-    contextMax: 200_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 120_000)
-})
-
-// The runtime reads `compression.threshold` (agent_init.py), NOT
-// `threshold_percent`, and its default is 0.50 — not 0.75.
-test('the runtime key is compression.threshold', async () => {
-  const plugin = await loadPlugin()
-
-  const threshold = plugin.deriveThreshold({
-    config: { compression: { threshold: 0.9 } },
-    contextMax: 200_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 180_000)
-})
-
-test('the runtime default of 50 percent applies with no compression config', async () => {
-  const plugin = await loadPlugin()
-
-  const threshold = plugin.deriveThreshold({
-    config: {},
-    contextMax: 128_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 64_000)
-})
-
-test('the live configuration shape resolves to its absolute ceiling', async () => {
-  const plugin = await loadPlugin()
-
-  // Exactly the block found in the running profile's config.yaml.
-  const threshold = plugin.deriveThreshold({
-    config: {
-      compression: {
-        enabled: true,
-        threshold: 0.9,
-        threshold_tokens: 250_000,
-        target_ratio: 0.15
-      }
-    },
-    contextMax: 200_000,
-    model: 'claude-opus-5'
-  })
-
-  // threshold_tokens is an absolute cap, clamped to the window.
-  assert.equal(threshold, 200_000)
-})
-
-test('a threshold of exactly 1 is read as the whole window, not one percent', async () => {
-  const plugin = await loadPlugin()
-
-  const threshold = plugin.deriveThreshold({
-    config: { compression: { threshold: 1 } },
-    contextMax: 128_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 128_000)
-})
-
-test('a nonsensical threshold falls back to the runtime default', async () => {
-  const plugin = await loadPlugin()
-
-  for (const bad of [0, -1, 'x', null, Number.NaN, Infinity, 250]) {
-    assert.equal(
-      plugin.deriveThreshold({
-        config: { compression: { threshold: bad } },
-        contextMax: 128_000,
-        model: 'claude-opus-5'
-      }),
-      64_000,
-      `threshold ${String(bad)} should fall back to 50%`
-    )
+  const request = async method => {
+    if (method === 'process.list') return { processes: [] }
+    // A config read would still not be enough, so it must not be attempted.
+    throw new Error(`unexpected RPC ${method}`)
   }
-})
 
-test('a disabled compressor has no compaction point at all', async () => {
-  const plugin = await loadPlugin()
-
-  // compression.enabled: false means the runtime never auto-compacts, so
-  // presenting any threshold would be a fabricated expectation.
-  const threshold = plugin.deriveThreshold({
-    config: {
-      compression: { enabled: false, threshold: 0.9, threshold_tokens: 250_000 }
+  const snapshot = await plugin.loadSessionPulse({
+    request,
+    sessionId: 'tab-a',
+    usage: {
+      context_used: 42_000,
+      context_max: 200_000,
+      compressions: 1,
+      model: 'claude-opus-5'
     },
-    contextMax: 200_000,
-    model: 'claude-opus-5'
+    subagents: null
   })
 
-  assert.equal(threshold, null)
+  assert.equal(snapshot.thresholdTokens, null)
+  // The values that ARE trustworthy must survive.
+  assert.equal(snapshot.activeTokens, 42_000)
+  assert.equal(snapshot.maxTokens, 200_000)
+  assert.equal(snapshot.compactions, 1)
 })
 
-test('compression enabled by omission still yields a threshold', async () => {
+test('no config read is issued at all', async () => {
   const plugin = await loadPlugin()
+  const calls = []
+  const request = async method => {
+    calls.push(method)
+    if (method === 'process.list') return { processes: [] }
+    throw new Error(`unexpected RPC ${method}`)
+  }
 
-  // The runtime default is enabled=True, so an absent key must not disable it.
-  const threshold = plugin.deriveThreshold({
-    config: { compression: { threshold: 0.5 } },
-    contextMax: 128_000,
-    model: 'claude-opus-5'
+  await plugin.loadSessionPulse({
+    request,
+    sessionId: 'tab-a',
+    usage: { context_used: 1, context_max: 200_000 },
+    subagents: null
   })
 
-  assert.equal(threshold, 64_000)
+  assert.deepEqual(calls, ['process.list'])
+  assert.ok(!calls.includes('config.get'), 'config must not be read at all')
 })
 
-test('the threshold stays unknown without a context maximum', async () => {
+test('the runtime threshold is preferred when the runtime ever reports it', async () => {
   const plugin = await loadPlugin()
+  const request = async method => {
+    if (method === 'process.list') return { processes: [] }
+    throw new Error(`unexpected RPC ${method}`)
+  }
 
-  const threshold = plugin.deriveThreshold({
-    config: { compression: { threshold: 0.75 } },
-    contextMax: null,
-    model: 'claude-opus-5'
+  // Forward-compatible: if a future runtime adds the effective threshold to the
+  // streamed usage payload, use it verbatim rather than deriving anything.
+  const snapshot = await plugin.loadSessionPulse({
+    request,
+    sessionId: 'tab-a',
+    usage: {
+      context_used: 42_000,
+      context_max: 200_000,
+      threshold_tokens: 171_000
+    },
+    subagents: null
   })
 
-  assert.equal(threshold, null)
+  assert.equal(snapshot.thresholdTokens, 171_000)
 })
 
-test('a percentage expressed as a whole number is read as a percentage', async () => {
+test('a reported threshold is still clamped to the window', async () => {
   const plugin = await loadPlugin()
+  const request = async method => {
+    if (method === 'process.list') return { processes: [] }
+    throw new Error(`unexpected RPC ${method}`)
+  }
 
-  const threshold = plugin.deriveThreshold({
-    config: { compression: { threshold: 75 } },
-    contextMax: 128_000,
-    model: 'claude-opus-5'
+  const snapshot = await plugin.loadSessionPulse({
+    request,
+    sessionId: 'tab-a',
+    usage: {
+      context_used: 1_000,
+      context_max: 128_000,
+      context_threshold: 999_000
+    },
+    subagents: null
   })
 
-  assert.equal(threshold, 96_000)
-})
-
-test('a derived threshold never exceeds the context maximum', async () => {
-  const plugin = await loadPlugin()
-
-  const threshold = plugin.deriveThreshold({
-    config: { compression: { threshold_tokens: 999_000 } },
-    contextMax: 128_000,
-    model: 'claude-opus-5'
-  })
-
-  assert.equal(threshold, 128_000)
+  assert.equal(snapshot.thresholdTokens, 128_000)
 })

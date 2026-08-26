@@ -28,14 +28,18 @@ test('the plugin identity matches its folder name', async () => {
   assert.equal(typeof plugin.default.register, 'function')
 })
 
-test('the plugin contributes to a status bar area the SDK actually exposes', async () => {
+test('the plugin contributes to the composer underside strip', async () => {
   const { contributions, sdk, ctx } = registerHarness()
   const plugin = await loadPlugin({ sdk })
 
   plugin.default.register(ctx)
 
+  // The UI contract asks for a thin strip below the composer, and
+  // COMPOSER_AREAS.underside is real ('composer.underside', a floating strip
+  // below the whole composer) — verified in the desktop source and re-exported
+  // by the plugin SDK.
   assert.equal(contributions.length, 1)
-  assert.equal(contributions[0].area, 'statusBar.right')
+  assert.equal(contributions[0].area, 'composer.underside')
   assert.equal(typeof contributions[0].render, 'function')
 })
 
@@ -82,11 +86,17 @@ test('a subagent event on one tab does not affect another tab', async () => {
   wildcard.fn({ type: 'message.delta', session_id: 'tab-b', payload: {} })
 
   const tracker = plugin.createSubagentTracker()
+  // A reliable global zero is what makes the event record a census.
+  tracker.observeGlobalActive(0)
   tracker.observe('subagent.start', 'tab-a', { subagent_id: 's1' })
   tracker.observe('message.delta', 'tab-b', {})
 
   assert.equal(tracker.countFor('tab-a'), 1)
-  assert.equal(tracker.countFor('tab-b'), null, 'a non-subagent event must not create a tab')
+  assert.equal(
+    tracker.countFor('tab-b'),
+    0,
+    'a non-subagent event must not create activity on another tab'
+  )
 })
 
 test('a malformed event frame never throws out of the listener', async () => {

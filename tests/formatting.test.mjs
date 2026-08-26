@@ -9,16 +9,13 @@ test('formatTokenCount renders a compact whole-thousand value', async () => {
   assert.equal(plugin.formatTokenCount(42_000), '42k')
 })
 
-test('loadSessionPulse scopes its reads to the focused runtime and derives the threshold', async () => {
+test('loadSessionPulse scopes its only read to the focused runtime', async () => {
   const plugin = await loadPlugin()
   const calls = []
   const request = async (method, params) => {
     calls.push([method, params])
     if (method === 'process.list') {
       return { processes: [{ status: 'running' }, { status: 'exited' }] }
-    }
-    if (method === 'config.get') {
-      return { config: { compression: { threshold: 0.75 } } }
     }
     throw new Error(`unexpected RPC ${method}`)
   }
@@ -36,12 +33,12 @@ test('loadSessionPulse scopes its reads to the focused runtime and derives the t
   })
 
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
-    ['process.list', { session_id: 'runtime-tab-b' }],
-    ['config.get', { key: 'full' }]
+    ['process.list', { session_id: 'runtime-tab-b' }]
   ])
   assert.deepEqual(JSON.parse(JSON.stringify(snapshot)), {
     activeTokens: 42_000,
-    thresholdTokens: 96_000,
+    // The runtime reports no threshold, and it cannot be honestly derived.
+    thresholdTokens: null,
     maxTokens: 128_000,
     compactions: 3,
     subagents: 2,
@@ -55,7 +52,6 @@ test('loadSessionPulse never queries a global subagent RPC', async () => {
   const request = async method => {
     calls.push(method)
     if (method === 'process.list') return { processes: [] }
-    if (method === 'config.get') return { config: {} }
     throw new Error(`unexpected RPC ${method}`)
   }
 
@@ -76,7 +72,6 @@ test('loadSessionPulse never dispatches a slash command', async () => {
   const request = async method => {
     calls.push(method)
     if (method === 'process.list') return { processes: [] }
-    if (method === 'config.get') return { config: {} }
     throw new Error(`unexpected RPC ${method}`)
   }
 
@@ -94,7 +89,6 @@ test('loadSessionPulse preserves reliable categories when one RPC is unavailable
   const plugin = await loadPlugin()
   const request = async method => {
     if (method === 'process.list') throw new Error('method unavailable')
-    if (method === 'config.get') return { config: {} }
     throw new Error(`unexpected RPC ${method}`)
   }
 
@@ -107,8 +101,8 @@ test('loadSessionPulse preserves reliable categories when one RPC is unavailable
 
   assert.deepEqual(JSON.parse(JSON.stringify(snapshot)), {
     activeTokens: 42_000,
-    // Empty compression config → runtime default of 50%.
-    thresholdTokens: 64_000,
+    // The runtime reports no threshold; it is never guessed from config.
+    thresholdTokens: null,
     maxTokens: 128_000,
     compactions: 1,
     subagents: 0,
@@ -116,21 +110,21 @@ test('loadSessionPulse preserves reliable categories when one RPC is unavailable
   })
 })
 
-test('loadSessionPulse leaves the threshold unknown when config cannot be read', async () => {
+test('a stale threshold field of zero reads as unknown, not as zero', async () => {
   const plugin = await loadPlugin()
   const request = async method => {
     if (method === 'process.list') return { processes: [] }
-    if (method === 'config.get') throw new Error('config unavailable')
     throw new Error(`unexpected RPC ${method}`)
   }
 
   const snapshot = await plugin.loadSessionPulse({
     request,
     sessionId: 'runtime-tab-a',
-    usage: { context_used: 42_000, context_max: 128_000 },
+    usage: { context_used: 42_000, context_max: 128_000, threshold_tokens: 0 },
     subagents: null
   })
 
+  // A threshold of zero is not a real compaction point.
   assert.equal(snapshot.thresholdTokens, null)
   assert.equal(snapshot.activeTokens, 42_000)
 })
@@ -162,7 +156,6 @@ test('a compression sentinel of minus one reads as unknown, not as zero', async 
   const plugin = await loadPlugin()
   const request = async method => {
     if (method === 'process.list') return { processes: [] }
-    if (method === 'config.get') return { config: {} }
     throw new Error(`unexpected RPC ${method}`)
   }
 

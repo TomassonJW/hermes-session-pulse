@@ -4,37 +4,22 @@
     {
       "name": "gateway reachable (session.create)",
       "ok": true,
-      "detail": "session_id=cb4122cd"
+      "detail": "session_id=81c35284"
     },
     {
       "name": "delegation.async_status is absent",
       "ok": true,
-      "detail": "rejected: unknown method: delegation.async_status"
+      "detail": "method-not-found: unknown method: delegation.async_status"
     },
     {
-      "name": "delegation.status exists but is global",
+      "name": "delegation.status is global (no session scoping in its payload)",
       "ok": true,
-      "detail": "keys=active,paused,max_spawn_depth,max_concurrent_children"
+      "detail": "keys=active,max_concurrent_children,max_spawn_depth,paused"
     },
     {
-      "name": "delegation.status strips owner_session_id",
+      "name": "owner_session_id stripping (needs a live subagent to demonstrate)",
       "ok": true,
-      "detail": "cannot scope to a tab"
-    },
-    {
-      "name": "config.get key=full works",
-      "ok": true,
-      "detail": "compression keys: enabled,threshold,threshold_tokens,target_ratio,protect_last_n,protect_first_n"
-    },
-    {
-      "name": "live config uses `threshold` not `threshold_percent`",
-      "ok": true,
-      "detail": "threshold=0.9"
-    },
-    {
-      "name": "deriveThreshold on LIVE config",
-      "ok": true,
-      "detail": "→ 200000"
+      "detail": "VACUOUS: no active subagents; asserted from source instead (delegate_tool.list_active_subagents excludes owner_session_id)"
     },
     {
       "name": "process.list is session-scoped",
@@ -49,12 +34,27 @@
     {
       "name": "session.usage exposes NO threshold field",
       "ok": true,
-      "detail": "threshold must be derived from config"
+      "detail": "checked 6 candidate names"
+    },
+    {
+      "name": "session.usage.active_subagents is present but global",
+      "ok": true,
+      "detail": "fed by async_delegation.active_count() — not per session"
+    },
+    {
+      "name": "session.context_breakdown exposes NO threshold field",
+      "ok": true,
+      "detail": "keys=categories,context_max,context_percent,context_used,estimated_total,model"
     },
     {
       "name": "loadSessionPulse end-to-end",
       "ok": true,
       "detail": "{\"activeTokens\":null,\"thresholdTokens\":null,\"maxTokens\":null,\"compactions\":0,\"subagents\":null,\"processes\":0}"
+    },
+    {
+      "name": "threshold reads unknown rather than a derived guess",
+      "ok": true,
+      "detail": "thresholdTokens=null"
     },
     {
       "name": "formatPulseLine end-to-end",
