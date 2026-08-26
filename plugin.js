@@ -395,6 +395,13 @@ export async function loadSessionPulse({
 // Hermes Desktop binding.
 
 const PLUGIN_ID = 'hermes-session-pulse'
+// Affiché dans l'infobulle. Hermes Desktop ne charge QUE les plugins locaux à la
+// machine qui fait tourner l'application : quand la passerelle est distante, un
+// fichier déposé côté serveur n'atteint jamais l'application. Le symptôme est
+// silencieux et stable — l'affichage fonctionne, il ignore simplement toute
+// correction — et se confond avec un défaut de logique. Une version visible rend
+// un fichier périmé identifiable d'un coup d'œil. Voir issue #5.
+const PLUGIN_VERSION = '1.4.0'
 
 const ACCENT_BY_STATE = {
   over: 'var(--ui-accent)',
@@ -466,9 +473,15 @@ function SessionPulseChip({ tracker }) {
   // explication est indiscernable d'un plugin cassé, et c'est précisément le
   // temps que cette enquête a coûté.
   const reason = snapshot.thresholdTokens === null ? __lastConfigError() : null
-  const label = reason
-    ? `${accessibleLabel(snapshot)} — seuil indisponible : ${reason}`
-    : accessibleLabel(snapshot)
+  const label = [
+    accessibleLabel(snapshot),
+    reason ? `seuil indisponible : ${reason}` : null,
+    // Une version visible est le seul moyen de distinguer « le code est faux »
+    // de « le fichier chargé est périmé ».
+    `pulse v${PLUGIN_VERSION}`
+  ]
+    .filter(Boolean)
+    .join(' — ')
 
   return jsx(Tip, {
     label,

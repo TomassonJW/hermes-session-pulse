@@ -30,12 +30,18 @@ numbers.
 
 ## Install
 
-Copy `plugin.js` into your Hermes desktop plugins directory, keeping the folder
-name equal to the plugin id:
+> **Install it on the machine running the desktop app.** Hermes Desktop scans
+> local plugin roots only — the remote backend's `hermes_home` never feeds the
+> plugin scan. If your gateway runs on a remote box, copying `plugin.js` there
+> has **no effect**: the app keeps loading its own local copy. This failure is
+> silent and stable (the chip renders, it just ignores every change) and reads
+> exactly like a logic bug. Hover the chip: the tooltip ends with
+> `pulse v<version>`, so a stale file is visible at a glance.
 
 ```bash
 mkdir -p ~/.hermes/desktop-plugins/hermes-session-pulse
-cp plugin.js ~/.hermes/desktop-plugins/hermes-session-pulse/plugin.js
+cd ~/.hermes/desktop-plugins/hermes-session-pulse
+curl -O https://raw.githubusercontent.com/TomassonJW/hermes-session-pulse/main/plugin.js
 ```
 
 The desktop app watches that directory and loads the plugin within a few
