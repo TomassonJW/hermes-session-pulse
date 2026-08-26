@@ -281,34 +281,53 @@ const EMPTY_SNAPSHOT = {
   processes: null
 }
 
-// Le bloc `compression` de la configuration ne change quasiment jamais, mais
-// une requête séparée mise en cache cinq minutes rendait le seuil inconnu de
-// façon durable dès que la toute première lecture échouait (socket du gateway
-// pas encore ouverte au montage, changement de profil en cours). On mémorise
-// donc uniquement les SUCCÈS : un échec transitoire est réessayé au
-// rafraîchissement suivant, cinq secondes plus tard.
-let cachedCompression = null
+// Le bloc `compression` de la configuration ne change quasiment jamais, mais il
+// est PROPRE AU PROFIL : sur ce poste, seul `default` porte un plafond et les
+// profils secondaires n'ont aucun bloc `compression`. Le cache est donc
+// cloisonné par profil, sans quoi une lecture adressée à un profil secondaire
+// condamnait l'affichage du seuil pour tous les autres.
+//
+// Et seul un bloc RÉELLEMENT LU est mémorisé : une réponse valide mais sans
+// bloc exploitable n'est pas un succès, elle est réessayée au tick suivant.
+const compressionByProfile = new Map()
+// Dernière erreur de lecture, exposée pour le diagnostic. Un `catch` muet rend
+// une panne en conditions réelles impossible à expliquer : on garde la trace.
+let lastConfigError = null
 
 export function __resetCompressionCache() {
-  cachedCompression = null
+  compressionByProfile.clear()
+  lastConfigError = null
 }
 
-const readCompression = async request => {
-  if (cachedCompression) return cachedCompression
+export function __lastConfigError() {
+  return lastConfigError
+}
+
+const readCompression = async (request, profile) => {
+  const cacheKey = profile || '(actif)'
+  const cached = compressionByProfile.get(cacheKey)
+  if (cached) return cached
+
   try {
-    const answer = await request('config.get', { key: 'full' })
+    const params = profile ? { key: 'full', profile } : { key: 'full' }
+    const answer = await request('config.get', params)
     const block = answer?.config?.compression
-    if (block && typeof block === 'object') {
-      cachedCompression = block
+
+    if (block && typeof block === 'object' && Object.keys(block).length > 0) {
+      compressionByProfile.set(cacheKey, block)
+      lastConfigError = null
       return block
     }
-    // Une configuration sans bloc `compression` est une réponse valide : le
-    // runtime appliquera ses défauts, dont aucun plafond. Mémorisée telle
-    // quelle pour ne pas re-interroger en boucle.
-    cachedCompression = {}
-    return cachedCompression
-  } catch {
-    // Volontairement pas mémorisé : on réessaiera.
+
+    // Réponse valide, mais sans bloc `compression` exploitable. Ce n'est PAS un
+    // succès à mémoriser : c'est exactement ce que renvoie un profil secondaire
+    // de ce poste, et le mémoriser condamnait le seuil définitivement.
+    lastConfigError =
+      `aucun bloc compression pour le profil ${cacheKey} ` +
+      `(réponse: ${answer && typeof answer === 'object' ? Object.keys(answer).join(',') : typeof answer})`
+    return null
+  } catch (error) {
+    lastConfigError = `${cacheKey}: ${String(error?.message || error)}`
     return null
   }
 }
@@ -316,23 +335,34 @@ const readCompression = async request => {
 // `subagents` vient du suivi d'événements de l'appelant, pas d'une requête :
 // toute RPC de sous-agents est globale, et un décompte global attribué à un
 // onglet serait un mensonge.
+//
+// `profile` est le profil PROPRIÉTAIRE de l'onglet affiché. Sans lui, les
+// lectures partent vers la passerelle active, qui n'est pas nécessairement
+// celle qui possède cet onglet.
 export async function loadSessionPulse({
   request,
   sessionId,
   usage,
   subagents = null,
-  config = null
+  config = null,
+  profile = null
 }) {
   if (!sessionId) return { ...EMPTY_SNAPSHOT }
 
+  const processParams = profile
+    ? { session_id: sessionId, profile }
+    : { session_id: sessionId }
+
   const [processResult, compression] = await Promise.all([
-    request('process.list', { session_id: sessionId }).then(
+    request('process.list', processParams).then(
       value => ({ ok: true, value }),
       () => ({ ok: false })
     ),
     // Une configuration explicitement fournie (tests, appelant qui l'a déjà)
     // court-circuite la lecture.
-    config?.compression ? Promise.resolve(config.compression) : readCompression(request)
+    config?.compression
+      ? Promise.resolve(config.compression)
+      : readCompression(request, profile)
   ])
 
   const maxTokens = finiteOrNull(usage?.context_max)
@@ -378,6 +408,11 @@ function SessionPulseChip({ tracker }) {
   // whole point of this plugin. activeSessionId would leak another tab's data.
   const sessionId = useValue(host.state.focusedSessionId)
   const usage = useValue(host.state.focusedUsage)
+  // Profil PROPRIÉTAIRE de l'onglet affiché. Sans lui, les lectures partent
+  // vers la passerelle active, qui n'est pas forcément celle qui possède cet
+  // onglet — et sur ce poste seul `default` porte un plafond de compaction, les
+  // profils secondaires n'en ayant aucun.
+  const ownerProfile = useValue(host.state.focusedSessionProfile)
 
   // Streamed usage carries the GLOBAL active_subagents counter; a reliable zero
   // there is the only inference it licenses for an unobserved tab.
@@ -395,7 +430,10 @@ function SessionPulseChip({ tracker }) {
       usage?.context_used ?? null,
       usage?.context_max ?? null,
       usage?.compressions ?? null,
-      globalActive
+      globalActive,
+      // Le profil propriétaire fait partie de l'identité de la requête : deux
+      // profils ne doivent jamais partager une entrée de cache.
+      ownerProfile ?? null
     ],
     enabled: Boolean(sessionId),
     // `process.list` est peu coûteuse et session-scopée : quelques secondes
@@ -413,7 +451,8 @@ function SessionPulseChip({ tracker }) {
         request: (method, params) => host.request(method, params),
         sessionId,
         usage,
-        subagents: tracker.countFor(sessionId)
+        subagents: tracker.countFor(sessionId),
+        profile: ownerProfile || null
       })
     }
   })
@@ -423,11 +462,19 @@ function SessionPulseChip({ tracker }) {
   const snapshot = data ?? EMPTY_SNAPSHOT
   const state = thresholdState(snapshot)
 
+  // Quand le seuil est inconnu, l'infobulle dit POURQUOI. Un tiret sans
+  // explication est indiscernable d'un plugin cassé, et c'est précisément le
+  // temps que cette enquête a coûté.
+  const reason = snapshot.thresholdTokens === null ? __lastConfigError() : null
+  const label = reason
+    ? `${accessibleLabel(snapshot)} — seuil indisponible : ${reason}`
+    : accessibleLabel(snapshot)
+
   return jsx(Tip, {
-    label: accessibleLabel(snapshot),
+    label,
     children: jsx('span', {
       role: 'status',
-      'aria-label': accessibleLabel(snapshot),
+      'aria-label': label,
       className: cn(
         'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] tabular-nums'
       ),

@@ -269,22 +269,31 @@ async function main() {
 
     // Full end-to-end run through the plugin's real code path.
     try {
-      const cfg = await request('config.get', { key: 'full' })
+      // La lecture doit fonctionner en visant EXPLICITEMENT le profil, comme le
+      // fait le composant. Si le gateway ignorait ce paramètre, le seuil serait
+      // celui du mauvais profil.
+      const cfg = await request('config.get', { key: 'full', profile: 'default' })
       const compression = cfg?.config?.compression || {}
+      record(
+        'config.get accepte un profil explicite',
+        Boolean(compression.threshold_tokens),
+        `threshold_tokens=${compression.threshold_tokens}`
+      )
+
       const snapshot = await plugin.loadSessionPulse({
         request,
         sessionId,
         usage,
         subagents: null,
-        config: { compression }
+        profile: 'default'
       })
       record('loadSessionPulse end-to-end', true, JSON.stringify(snapshot))
       record('formatPulseLine end-to-end', true, plugin.formatPulseLine(snapshot))
       record('thresholdState end-to-end', true, plugin.thresholdState(snapshot))
       record('accessibleLabel end-to-end', true, plugin.accessibleLabel(snapshot))
 
-      // Le cas réel signalé par l'utilisateur : 381k occupés, C0 affiché, seuil
-      // absent. Rejoué avec la configuration LIVE du profil.
+      // Le cas réel signalé par l'utilisateur, rejoué de bout en bout SANS
+      // configuration fournie : le plugin doit la lire lui-même.
       const reported = await plugin.loadSessionPulse({
         request,
         sessionId,
@@ -295,23 +304,19 @@ async function main() {
           compressions: 0
         },
         subagents: null,
-        config: { compression }
+        profile: 'default'
       })
       record(
-        'cas réel: le seuil est démontré depuis la config live',
+        'cas réel: le seuil est lu par le plugin lui-même',
         reported.thresholdTokens !== null,
-        `seuil=${reported.thresholdTokens} (plafond configuré=${compression.threshold_tokens})`
+        `seuil=${reported.thresholdTokens} (dernière erreur: ${plugin.__lastConfigError() || 'aucune'})`
       )
       record(
         'cas réel: C0 incohérent devient inconnu',
         reported.compactions === null,
         `compactions=${reported.compactions} car 381k >= seuil`
       )
-      record(
-        'cas réel: ligne affichée',
-        true,
-        plugin.formatPulseLine(reported)
-      )
+      record('cas réel: ligne affichée', true, plugin.formatPulseLine(reported))
     } catch (e) {
       record('loadSessionPulse end-to-end', false, e.message)
     }

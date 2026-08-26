@@ -16,11 +16,20 @@ const harness = ({ focusedSessionId, focusedUsage = null }) => {
   const queryCalls = []
   const sdk = {
     host: {
-      state: { focusedSessionId: 'atom:sid', focusedUsage: 'atom:usage' },
+      state: {
+        focusedSessionId: 'atom:sid',
+        focusedUsage: 'atom:usage',
+        focusedSessionProfile: 'atom:profile'
+      },
       request: async () => ({}),
       onEvent: () => () => {}
     },
-    useValue: atom => (atom === 'atom:sid' ? focusedSessionId : focusedUsage),
+    useValue: atom => {
+      if (atom === 'atom:sid') return focusedSessionId
+      if (atom === 'atom:usage') return focusedUsage
+      if (atom === 'atom:profile') return 'default'
+      return undefined
+    },
     useQuery: options => {
       queryCalls.push(options)
       // Simulate a pending fetch for a newly-focused tab: React Query would

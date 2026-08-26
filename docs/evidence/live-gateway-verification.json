@@ -4,7 +4,7 @@
     {
       "name": "gateway reachable (session.create)",
       "ok": true,
-      "detail": "session_id=2cd112a8"
+      "detail": "session_id=b80c7d90"
     },
     {
       "name": "delegation.async_status is absent",
@@ -47,6 +47,11 @@
       "detail": "keys=categories,context_max,context_percent,context_used,estimated_total,model"
     },
     {
+      "name": "config.get accepte un profil explicite",
+      "ok": true,
+      "detail": "threshold_tokens=250000"
+    },
+    {
       "name": "loadSessionPulse end-to-end",
       "ok": true,
       "detail": "{\"activeTokens\":null,\"thresholdTokens\":null,\"maxTokens\":null,\"compactions\":0,\"subagents\":null,\"processes\":0}"
@@ -67,9 +72,9 @@
       "detail": "Context in use: unknown tokens. compaction expected at: unknown tokens. model limit: unknown tokens. compactions so far: 0. active subagents: unknown. active processes: 0."
     },
     {
-      "name": "cas réel: le seuil est démontré depuis la config live",
+      "name": "cas réel: le seuil est lu par le plugin lui-même",
       "ok": true,
-      "detail": "seuil=250000 (plafond configuré=250000)"
+      "detail": "seuil=250000 (dernière erreur: aucune)"
     },
     {
       "name": "cas réel: C0 incohérent devient inconnu",
