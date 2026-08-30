@@ -7,10 +7,15 @@ conversation tab only**.
 42k / 96k / 128k · C3 · A2 · P1
 ```
 
+When Hermes does not publish the exact trigger, the second value is shown as a
+safe upper bound, for example `42k / ≤96k / 128k`. The `≤` is intentional: an
+unpublished output reservation can only lower the effective trigger.
+
 | Field | Meaning |
 |---|---|
 | `42k` | tokens currently occupying the context window |
-| `96k` | tokens at which auto-compaction is expected |
+| `96k` | exact tokens at which auto-compaction is expected |
+| `≤96k` | safe upper bound when the runtime keeps the exact trigger private |
 | `128k` | the model's context limit |
 | `C3` | compactions so far in this conversation |
 | `A2` | subagents currently active for this tab |
@@ -63,7 +68,7 @@ The reasoning, including the claims that turned out to be wrong, is recorded in
   usage the desktop already streams for the focused session. No RPC needed.
 - **Processes** come from `process.list({ session_id })`, which is genuinely
   session-scoped (it matches on the registry's `session_key`). This is the only
-  RPC the plugin issues.
+  session-scoped RPC; `config.get` reads the profile configuration.
 - **Subagents** are counted from the `subagent.*` event stream, because every
   gateway event frame carries its own `session_id`. They cannot be obtained per
   tab over RPC: `delegation.status` takes no session id, and
@@ -72,20 +77,21 @@ The reasoning, including the claims that turned out to be wrong, is recorded in
   (`session.usage.active_subagents === 0`) proves nothing is running anywhere —
   otherwise a plugin that loaded mid-flight would report a partial history as a
   complete census.
-- **The compaction threshold** is shown **only if the runtime reports it**, and
-  reads `—` otherwise. It deliberately is not derived from config: the real
-  resolution raises the percentage to 75% for any window under 512K, applies it
-  to `context_length - max_tokens` (a value no plugin can read), floors it, and
-  treats `threshold_tokens` as a *cap* rather than a winner. Reproducing that
-  from config produces a confident wrong number, which is worse than admitting
-  ignorance. See issue #2.
+- **The compaction threshold** uses the runtime value when it is published. If
+  it is not, the plugin reads the profile's `compression` block and calculates a
+  safe upper bound from the ratio, including the 75% floor below 512K and the
+  `threshold_tokens` cap. The bound is marked `≤` because the effective runtime
+  value also applies `context_length - max_tokens`, and the implicit output
+  reservation may remain private. If `max_tokens` is explicit in the profile,
+  the plugin can calculate the exact value.
 
 ## What it will not do
 
 - No mutation of any kind: no `slash.exec`, no `delegation.pause`, no
   `process.kill`, no `config.set`.
-- No reads of `state.db`, transcripts, prompts, or secrets. The plugin does not
-  read your configuration at all; `process.list` is its only RPC.
+- No reads of `state.db`, transcripts, prompts, or secrets. The plugin reads
+  only `config.get` for the profile's full configuration and `process.list` for
+  session-scoped processes; it never renders credentials or unrelated config.
 - No conversation content, subagent goal, command line, or private path is ever
   rendered.
 - No hardcoded colors: only Hermes theme variables, so it follows your theme.

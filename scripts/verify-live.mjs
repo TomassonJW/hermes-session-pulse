@@ -201,8 +201,8 @@ async function main() {
     record('delegation.status is global (no session scoping in its payload)', false, e.message)
   }
 
-  // The plugin no longer reads config at all, but we still prove WHY: the
-  // threshold is absent from every read a plugin can perform.
+  // The runtime may or may not publish the exact threshold. We still probe the
+  // known usage payloads so the plugin's config fallback remains explicit.
   const THRESHOLD_NAMES = [
     'context_threshold',
     'threshold_tokens',

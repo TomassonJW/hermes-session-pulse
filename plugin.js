@@ -15,8 +15,19 @@ export function formatTokenCount(value) {
   return `${Math.round(value / 1_000)}k`
 }
 
-const finiteOrNull = value =>
-  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+const finiteOrNull = value => {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value >= 0 ? value : null
+  }
+  // YAML / config.get may quote integers (`threshold_tokens: '245000'`).
+  // The compressor accepts int("245000"); the chip must not ignore the cap.
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  // Decimal digits only — reject hex, exponents, and empty quotes.
+  if (!/^[0-9]+(?:\.[0-9]+)?$/.test(trimmed)) return null
+  const number = Number(trimmed)
+  return Number.isFinite(number) && number >= 0 ? number : null
+}
 
 const runningProcessCount = payload => {
   const rows = Array.isArray(payload?.processes)
@@ -123,18 +134,18 @@ export function createSubagentTracker({ maxSessions = DEFAULT_MAX_TRACKED_SESSIO
 // plugin. Mais `ratio` DÉCROÎT quand `max_tokens` croît : si le plafond
 // configuré est déjà inférieur au ratio calculé avec une réserve de sortie
 // généreuse, alors le plafond gagne pour toute valeur réelle de `max_tokens`.
-// C'est une démonstration, pas une estimation — et elle couvre le cas courant
-// d'un `threshold_tokens` explicitement configuré.
-//
-// Hors de ce cas, le seuil reste inconnu plutôt que deviné.
+// Un seuil exact vient du runtime ou d'une réserve de sortie explicitement
+// connue. Sinon, l'interface peut encore afficher une borne haute sûre : le
+// ratio est calculé avec une réserve nulle, puis le plafond éventuel est
+// appliqué. Cette borne ne sert jamais à déduire le nombre de compactions.
 
 const RUNTIME_DEFAULT_THRESHOLD = 0.5
 const SMALL_WINDOW_LIMIT = 512_000
 const SMALL_WINDOW_FLOOR = 0.75
 const MINIMUM_CONTEXT_LENGTH = 64_000
-// Réserve de sortie maximale plausible. Une valeur haute rend la preuve plus
-// exigeante, donc plus sûre : on ne conclut que si le plafond gagne même dans
-// le cas le plus défavorable.
+const MINIMUM_CONTEXT_TRIGGER_RATIO = 0.85
+// Réserve de sortie maximale plausible. Elle sert uniquement à prouver qu'un
+// plafond gagne quelle que soit la réserve réelle, jamais à fabriquer un seuil.
 const MAX_PLAUSIBLE_OUTPUT_RESERVE = 128_000
 
 const asFraction = value => {
@@ -166,26 +177,46 @@ const compressionEnabled = compression => {
 
 const reportedThreshold = usage =>
   finiteOrNull(
-    usage?.context_threshold ?? usage?.threshold_tokens ?? usage?.compaction_threshold
+    usage?.context_threshold ??
+      usage?.effective_threshold ??
+      usage?.threshold_tokens ??
+      usage?.compaction_threshold
   )
 
-export function resolveThreshold({ config, contextMax, model, usage }) {
+const configuredOutputReserve = ({ config, usage }) =>
+  finiteOrNull(
+    usage?.context_output_reserve ??
+      usage?.max_output_tokens ??
+      usage?.max_tokens ??
+      config?.model?.max_tokens
+  )
+
+const ratioThreshold = (contextMax, pct, outputReserve = 0) => {
+  let effectiveWindow = contextMax - outputReserve
+  if (effectiveWindow <= 0) effectiveWindow = contextMax
+
+  const floored = Math.max(Math.trunc(effectiveWindow * pct), MINIMUM_CONTEXT_LENGTH)
+  if (floored >= effectiveWindow) {
+    return Math.max(
+      1,
+      Math.min(Math.trunc(effectiveWindow * MINIMUM_CONTEXT_TRIGGER_RATIO), effectiveWindow - 1)
+    )
+  }
+  return floored
+}
+
+const thresholdInputs = ({ config, contextMax, model }) => {
   const max = finiteOrNull(contextMax)
-
-  // 1. Ce que le runtime rapporte lui-même gagne toujours.
-  const reported = reportedThreshold(usage)
-  if (reported) return max ? Math.min(max, reported) : reported
-
-  if (!max) return null
-
   const compression = config?.compression
-  // Un compresseur désactivé ne compacte jamais : aucun seuil à annoncer.
-  if (!compressionEnabled(compression)) return null
-
-  // 2. Sinon, le plafond absolu — mais seulement s'il est démontrablement
-  //    gagnant.
-  const cap = finiteOrNull(compression?.threshold_tokens)
-  if (!cap || cap >= max) return null
+  if (
+    !max ||
+    !compression ||
+    typeof compression !== 'object' ||
+    Object.keys(compression).length === 0 ||
+    !compressionEnabled(compression)
+  ) {
+    return null
+  }
 
   let pct =
     modelThresholdFraction(compression?.model_thresholds, model) ??
@@ -193,16 +224,53 @@ export function resolveThreshold({ config, contextMax, model, usage }) {
     RUNTIME_DEFAULT_THRESHOLD
   if (max < SMALL_WINDOW_LIMIT) pct = Math.max(pct, SMALL_WINDOW_FLOOR)
 
-  // Ratio dans le cas le plus défavorable au plafond : la plus grosse réserve
-  // de sortie plausible, donc le plus petit ratio possible.
-  const worstCaseWindow = Math.max(max - MAX_PLAUSIBLE_OUTPUT_RESERVE, 1)
-  const worstCaseRatio = Math.max(
-    Math.trunc(worstCaseWindow * pct),
-    MINIMUM_CONTEXT_LENGTH
-  )
+  return {
+    max,
+    compression,
+    pct,
+    cap: finiteOrNull(compression?.threshold_tokens)
+  }
+}
 
-  // Le plafond gagne même dans ce cas : il gagne donc toujours.
-  return cap < worstCaseRatio ? cap : null
+const applyThresholdCap = (ratio, cap, max) => {
+  if (!cap || cap >= max) return ratio
+  return Math.min(ratio, cap)
+}
+
+export function resolveThreshold({ config, contextMax, model, usage }) {
+  const reported = reportedThreshold(usage)
+  const max = finiteOrNull(contextMax)
+  if (reported) return max ? Math.min(max, reported) : reported
+
+  const inputs = thresholdInputs({ config, contextMax, model })
+  if (!inputs) return null
+
+  const outputReserve = configuredOutputReserve({ config, usage })
+  // The provider's implicit output reservation is not published by the current
+  // gateway. Do not turn the upper bound into a fake exact threshold.
+  if (outputReserve === null) {
+    const worstCaseRatio = ratioThreshold(
+      inputs.max,
+      inputs.pct,
+      MAX_PLAUSIBLE_OUTPUT_RESERVE
+    )
+    return inputs.cap && inputs.cap < inputs.max && inputs.cap < worstCaseRatio
+      ? inputs.cap
+      : null
+  }
+
+  const ratio = ratioThreshold(inputs.max, inputs.pct, outputReserve)
+  return applyThresholdCap(ratio, inputs.cap, inputs.max)
+}
+
+export function resolveThresholdUpperBound({ config, contextMax, model }) {
+  const inputs = thresholdInputs({ config, contextMax, model })
+  if (!inputs) return null
+
+  // max_tokens can only reduce the usable input window. With a zero reserve,
+  // this is therefore the greatest threshold compatible with the config.
+  const ratio = ratioThreshold(inputs.max, inputs.pct)
+  return applyThresholdCap(ratio, inputs.cap, inputs.max)
 }
 
 // ── Compactions ─────────────────────────────────────────────────────────────
@@ -232,11 +300,17 @@ const NEAR_THRESHOLD_FRACTION = 0.9
 export function formatPulseLine(snapshot) {
   const counter = (prefix, value) =>
     `${prefix}${value === null || value === undefined ? UNKNOWN : Math.trunc(value)}`
+  const threshold =
+    finiteOrNull(snapshot?.thresholdTokens) !== null
+      ? formatTokenCount(snapshot.thresholdTokens)
+      : finiteOrNull(snapshot?.thresholdUpperBoundTokens) === null
+        ? UNKNOWN
+        : `≤${formatTokenCount(snapshot.thresholdUpperBoundTokens)}`
 
   return [
     [
       formatTokenCount(snapshot?.activeTokens),
-      formatTokenCount(snapshot?.thresholdTokens),
+      threshold,
       formatTokenCount(snapshot?.maxTokens)
     ].join(' / '),
     counter('C', snapshot?.compactions),
@@ -261,10 +335,16 @@ export function accessibleLabel(snapshot) {
     value === null || value === undefined
       ? 'unknown'
       : Math.trunc(value).toLocaleString('en-US')
+  const threshold =
+    finiteOrNull(snapshot?.thresholdTokens) !== null
+      ? exact(snapshot.thresholdTokens)
+      : finiteOrNull(snapshot?.thresholdUpperBoundTokens) === null
+        ? 'unknown'
+        : `at most ${exact(snapshot.thresholdUpperBoundTokens)}`
 
   return [
     `Context in use: ${exact(snapshot?.activeTokens)} tokens`,
-    `compaction expected at: ${exact(snapshot?.thresholdTokens)} tokens`,
+    `compaction expected at: ${threshold} tokens`,
     `model limit: ${exact(snapshot?.maxTokens)} tokens`,
     `compactions so far: ${exact(snapshot?.compactions)}`,
     `active subagents: ${exact(snapshot?.subagents)}`,
@@ -275,27 +355,28 @@ export function accessibleLabel(snapshot) {
 const EMPTY_SNAPSHOT = {
   activeTokens: null,
   thresholdTokens: null,
+  thresholdUpperBoundTokens: null,
   maxTokens: null,
   compactions: null,
   subagents: null,
   processes: null
 }
 
-// Le bloc `compression` de la configuration ne change quasiment jamais, mais il
-// est PROPRE AU PROFIL : sur ce poste, seul `default` porte un plafond et les
-// profils secondaires n'ont aucun bloc `compression`. Le cache est donc
-// cloisonné par profil, sans quoi une lecture adressée à un profil secondaire
-// condamnait l'affichage du seuil pour tous les autres.
+// La configuration complète ne change quasiment jamais, mais elle est PROPRE
+// AU PROFIL : sur ce poste, seul `default` porte un plafond et les profils
+// secondaires n'ont aucun bloc `compression`. Le cache est donc cloisonné par
+// profil, sans quoi une lecture adressée à un profil secondaire condamnait
+// l'affichage du seuil pour tous les autres.
 //
 // Et seul un bloc RÉELLEMENT LU est mémorisé : une réponse valide mais sans
 // bloc exploitable n'est pas un succès, elle est réessayée au tick suivant.
-const compressionByProfile = new Map()
+const configByProfile = new Map()
 // Dernière erreur de lecture, exposée pour le diagnostic. Un `catch` muet rend
 // une panne en conditions réelles impossible à expliquer : on garde la trace.
 let lastConfigError = null
 
 export function __resetCompressionCache() {
-  compressionByProfile.clear()
+  configByProfile.clear()
   lastConfigError = null
 }
 
@@ -303,20 +384,21 @@ export function __lastConfigError() {
   return lastConfigError
 }
 
-const readCompression = async (request, profile) => {
+const readConfig = async (request, profile) => {
   const cacheKey = profile || '(actif)'
-  const cached = compressionByProfile.get(cacheKey)
+  const cached = configByProfile.get(cacheKey)
   if (cached) return cached
 
   try {
     const params = profile ? { key: 'full', profile } : { key: 'full' }
     const answer = await request('config.get', params)
-    const block = answer?.config?.compression
+    const fullConfig = answer?.config
+    const block = fullConfig?.compression
 
     if (block && typeof block === 'object' && Object.keys(block).length > 0) {
-      compressionByProfile.set(cacheKey, block)
+      configByProfile.set(cacheKey, fullConfig)
       lastConfigError = null
-      return block
+      return fullConfig
     }
 
     // Réponse valide, mais sans bloc `compression` exploitable. Ce n'est PAS un
@@ -353,30 +435,39 @@ export async function loadSessionPulse({
     ? { session_id: sessionId, profile }
     : { session_id: sessionId }
 
-  const [processResult, compression] = await Promise.all([
+  const [processResult, configResult] = await Promise.all([
     request('process.list', processParams).then(
       value => ({ ok: true, value }),
       () => ({ ok: false })
     ),
     // Une configuration explicitement fournie (tests, appelant qui l'a déjà)
     // court-circuite la lecture.
-    config?.compression
-      ? Promise.resolve(config.compression)
-      : readCompression(request, profile)
+    config?.compression ? Promise.resolve(config) : readConfig(request, profile)
   ])
 
+  const runtimeConfig = config?.compression ? config : configResult
+  const compression = runtimeConfig?.compression
   const maxTokens = finiteOrNull(usage?.context_max)
   const activeTokens = finiteOrNull(usage?.context_used)
   const thresholdTokens = resolveThreshold({
-    config: compression ? { compression } : null,
+    config: runtimeConfig,
     contextMax: maxTokens,
     model: usage?.model,
     usage
   })
+  const thresholdUpperBoundTokens =
+    thresholdTokens === null
+      ? resolveThresholdUpperBound({
+          config: runtimeConfig,
+          contextMax: maxTokens,
+          model: usage?.model
+        })
+      : null
 
   return {
     activeTokens,
     thresholdTokens,
+    thresholdUpperBoundTokens,
     maxTokens,
     // Le compteur du runtime repart à zéro après une reprise : on refuse un
     // zéro que le dépassement du seuil contredit.
@@ -401,7 +492,7 @@ const PLUGIN_ID = 'hermes-session-pulse'
 // silencieux et stable — l'affichage fonctionne, il ignore simplement toute
 // correction — et se confond avec un défaut de logique. Une version visible rend
 // un fichier périmé identifiable d'un coup d'œil. Voir issue #5.
-const PLUGIN_VERSION = '1.4.0'
+const PLUGIN_VERSION = '1.5.1'
 
 const ACCENT_BY_STATE = {
   over: 'var(--ui-accent)',
@@ -473,8 +564,13 @@ function SessionPulseChip({ tracker }) {
   // explication est indiscernable d'un plugin cassé, et c'est précisément le
   // temps que cette enquête a coûté.
   const reason = snapshot.thresholdTokens === null ? __lastConfigError() : null
+  const thresholdNote =
+    snapshot.thresholdTokens === null && snapshot.thresholdUpperBoundTokens !== null
+      ? 'seuil exact non publié par Hermes ; borne haute affichée avec ≤'
+      : null
   const label = [
     accessibleLabel(snapshot),
+    thresholdNote,
     reason ? `seuil indisponible : ${reason}` : null,
     // Une version visible est le seul moyen de distinguer « le code est faux »
     // de « le fichier chargé est périmé ».

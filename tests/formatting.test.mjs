@@ -9,6 +9,23 @@ test('formatTokenCount renders a compact whole-thousand value', async () => {
   assert.equal(plugin.formatTokenCount(42_000), '42k')
 })
 
+test('an inexact threshold renders its safe upper bound with a qualifier', async () => {
+  const plugin = await loadPlugin()
+
+  const snapshot = {
+    activeTokens: 182_000,
+    thresholdTokens: null,
+    thresholdUpperBoundTokens: 235_000,
+    maxTokens: 272_000,
+    compactions: 2,
+    subagents: 0,
+    processes: 0
+  }
+
+  assert.equal(plugin.formatPulseLine(snapshot), '182k / ≤235k / 272k · C2 · A0 · P0')
+  assert.match(plugin.accessibleLabel(snapshot), /at most 235,000 tokens/)
+})
+
 test('loadSessionPulse scopes its session read to the focused runtime', async () => {
   const plugin = await loadPlugin()
   const calls = []
@@ -43,6 +60,7 @@ test('loadSessionPulse scopes its session read to the focused runtime', async ()
     activeTokens: 42_000,
     // The runtime reports no threshold, and it cannot be honestly derived.
     thresholdTokens: null,
+    thresholdUpperBoundTokens: null,
     maxTokens: 128_000,
     compactions: 3,
     subagents: 2,
@@ -107,6 +125,7 @@ test('loadSessionPulse preserves reliable categories when one RPC is unavailable
     activeTokens: 42_000,
     // The runtime reports no threshold; it is never guessed from config.
     thresholdTokens: null,
+    thresholdUpperBoundTokens: null,
     maxTokens: 128_000,
     compactions: 1,
     subagents: 0,
@@ -149,6 +168,7 @@ test('loadSessionPulse reports everything unknown without a focused session', as
   assert.deepEqual(JSON.parse(JSON.stringify(snapshot)), {
     activeTokens: null,
     thresholdTokens: null,
+    thresholdUpperBoundTokens: null,
     maxTokens: null,
     compactions: null,
     subagents: null,

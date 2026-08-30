@@ -34,6 +34,50 @@ test('le plafond est affiché quand il gagne quelle que soit la réserve de sort
   assert.equal(threshold, 250_000)
 })
 
+test('une borne haute de ratio reste visible quand le seuil effectif est inconnu', async () => {
+  const plugin = await loadPlugin()
+
+  const request = async method => {
+    if (method === 'process.list') return { processes: [] }
+    if (method === 'config.get') {
+      return { config: { compression: { threshold: 0.92, threshold_tokens: 235_000 } } }
+    }
+    throw new Error(`RPC inattendue ${method}`)
+  }
+
+  const snapshot = await plugin.loadSessionPulse({
+    request,
+    sessionId: 'onglet-sol',
+    usage: {
+      context_used: 182_000,
+      context_max: 272_000,
+      model: 'gpt-5.6-sol'
+    }
+  })
+
+  // Le seuil exact dépend encore de la réserve de sortie non publiée par le
+  // runtime, mais il ne peut pas dépasser le ratio de base plafonné.
+  assert.equal(snapshot.thresholdTokens, null)
+  assert.equal(snapshot.thresholdUpperBoundTokens, 235_000)
+  assert.equal(plugin.formatPulseLine(snapshot), '182k / ≤235k / 272k · C— · A— · P0')
+})
+
+test('une réserve de sortie explicite permet le seuil exact', async () => {
+  const plugin = await loadPlugin()
+
+  const threshold = plugin.resolveThreshold({
+    config: {
+      model: { max_tokens: 32_000 },
+      compression: { threshold: 0.92, threshold_tokens: 235_000 }
+    },
+    contextMax: 272_000,
+    model: 'gpt-5.6-sol',
+    usage: null
+  })
+
+  assert.equal(threshold, 220_800)
+})
+
 test('le seuil reste inconnu quand le plafond est trop proche du ratio', async () => {
   const plugin = await loadPlugin()
 
@@ -138,4 +182,42 @@ test('un seuil par modèle est pris en compte dans la preuve', async () => {
 
   // pct 0.5 -> ratio ~436k avec 128k de réserve : 250k reste prouvable.
   assert.equal(threshold, 250_000)
+})
+
+test('un plafond YAML en texte affiche le 245k réel, pas le ratio', async () => {
+  const plugin = await loadPlugin()
+  plugin.__resetCompressionCache()
+
+  // Cas réel Sillage : le runtime stocke threshold_tokens en chaîne
+  // ('245000'), accepte int("245000"), et compacte à 245k. Le plugin
+  // refusait la chaîne et affichait le ratio 88 % de 1M : ≤880k.
+  const request = async method => {
+    if (method === 'process.list') return { processes: [] }
+    if (method === 'config.get') {
+      return {
+        config: {
+          compression: { threshold: 0.88, threshold_tokens: '245000' }
+        }
+      }
+    }
+    throw new Error(`RPC inattendue ${method}`)
+  }
+
+  const snapshot = await plugin.loadSessionPulse({
+    request,
+    sessionId: 'sillage',
+    usage: {
+      context_used: 130_000,
+      context_max: 1_000_000,
+      model: 'grok-4.6',
+      compressions: 0
+    },
+    subagents: 0
+  })
+
+  assert.equal(snapshot.thresholdTokens, 245_000)
+  assert.equal(
+    plugin.formatPulseLine(snapshot),
+    '130k / 245k / 1000k · C0 · A0 · P0'
+  )
 })
