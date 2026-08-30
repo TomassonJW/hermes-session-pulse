@@ -2,7 +2,7 @@
 
 ## Frontière
 
-Le plugin est une contribution Desktop ESM sans compilation. Il ne lit pas directement `state.db`, les fichiers de session, les journaux, les secrets ou les transcriptions.
+Le plugin est une contribution Desktop ESM sans compilation. Il ne lit pas directement `state.db`, les fichiers de session, les journaux, les secrets ou les transcriptions. Sa seule lecture de configuration passe par `config.get` et reste limitée au profil propriétaire de l'onglet.
 
 ## Flux visé
 
@@ -28,20 +28,21 @@ les corrections apportées aux hypothèses initiales sont dans
 - contexte actif, maximum, compactions : `host.state.focusedUsage`, l'usage
   diffusé de la session focalisée, sans aucune RPC ;
 - processus : `process.list({ session_id })`, session-scopé par `session_key`.
-  C'est la seule RPC émise par le plugin ;
+  C'est la seule RPC session-scopée ; `config.get` lit la configuration du
+  profil propriétaire ;
 - sous-agents : flux d'événements `subagent.*`, session-scopé par construction.
   Aucune RPC de délégation n'est utilisable ici : `delegation.status` est globale
   et `list_active_subagents()` retire `owner_session_id`. Le comptage reste
   inconnu jusqu'à ce qu'un zéro global fiable prouve que rien ne tourne nulle
   part, sinon un historique partiel serait présenté comme un recensement ;
-- seuil de compaction : affiché **uniquement** si le runtime le rapporte. Il
-  n'est pas dérivé de la configuration, car la résolution réelle dépend d'entrées
-  qu'aucun plugin ne peut lire.
+- seuil de compaction : valeur exacte du runtime quand elle est publiée ; sinon
+  borne haute calculée depuis la configuration, affichée avec `≤` pour ne pas la
+  confondre avec le seuil effectif.
 
 ## Absence de source
 
-Si Hermes ne publie pas une donnée requise, elle est affichée `—`. Un zéro n'est
-montré qu'après une réponse fiable et vide. Aucun accès direct à un secret, à
-`state.db` ou au contenu de conversation n'est autorisé, aucune lecture de la
-configuration n'est effectuée, et aucune écriture n'a lieu : ni `slash.exec`, ni
+Si Hermes ne publie pas une donnée requise et qu'aucune borne sûre n'est
+calculable, elle est affichée `—`. Un zéro n'est montré qu'après une réponse
+fiable et vide. Aucun accès direct à un secret, à `state.db` ou au contenu de
+conversation n'est autorisé, et aucune écriture n'a lieu : ni `slash.exec`, ni
 `delegation.pause`, ni `process.kill`.

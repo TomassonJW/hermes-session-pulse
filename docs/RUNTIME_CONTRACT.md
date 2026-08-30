@@ -56,7 +56,7 @@ Zones réelles : `top`, `bottom`, `underside`, `leading`, `actions`,
 Leçon : une énumération dans un document n'est pas le contrat. Seul le source
 l'est.
 
-### 3. Le seuil de compaction n'est pas dérivable
+### 3. Le seuil effectif n'est pas toujours publiable
 
 Aucune lecture accessible au plugin ne l'expose. Vérifié en live : ni
 `session.usage` ni `session.context_breakdown` ne contiennent l'un des six noms
@@ -66,10 +66,11 @@ Le repli `/context` est écarté : `_live_slash_command_output` ne sert `context
 directement que si `_session_uses_compute_host(session)` est vrai, sinon la
 commande partait au worker. Lire une jauge ne doit pas exécuter une commande.
 
-**Et la dérivation depuis la configuration est également écartée.** Une première
-version reproduisait `compression.threshold` avec défaut 0,50 et présentait le
-résultat comme le seuil. C'était un nombre faux affiché avec assurance, car la
-résolution réelle (`agent/context_compressor.py`) fait davantage :
+**La dérivation depuis la configuration ne permet pas toujours l'exactitude.**
+Une première version reproduisait `compression.threshold` avec défaut 0,50 et
+présentait le résultat comme le seuil. C'était un nombre faux affiché avec
+assurance, car la résolution réelle (`agent/context_compressor.py`) fait
+davantage :
 
 1. le pourcentage est **relevé à 0,75 pour toute fenêtre inférieure à 512 000**
    (`_effective_threshold_percent`) : un modèle 128k ne garde donc pas un 0,50
@@ -83,10 +84,11 @@ résolution réelle (`agent/context_compressor.py`) fait davantage :
 5. des relèvements par provider et les moteurs de contexte externes peuvent
    encore tout remplacer.
 
-Une entrée manquante (`max_tokens`) suffit à rendre le calcul non reproductible.
-Le plugin ne lit donc plus la configuration du tout : il n'affiche que le seuil
-que le runtime lui donne, et `—` sinon. C'est la seule réponse honnête, et elle
-respecte l'invariant du projet.
+Une entrée manquante (`max_tokens`) suffit à rendre le seuil exact non
+reproductible. Le plugin affiche donc le seuil runtime quand il est disponible ;
+sinon il calcule depuis la configuration la plus grande valeur possible, avec
+une réserve de sortie nulle et le plafond éventuel. Cette valeur est marquée
+`≤` et reste exclue du contrôle de cohérence des compactions.
 
 ## Lectures retenues
 
@@ -95,10 +97,11 @@ respecte l'invariant du projet.
 | Contexte actif, maximum, compactions | `host.state.focusedUsage` | oui, natif |
 | Processus | `process.list({session_id})` | oui, `session_key` |
 | Sous-agents | flux `subagent.*`, après baseline | oui, par événement |
-| Seuil | uniquement si le runtime le rapporte | sinon `—` |
+| Seuil | runtime, ou borne haute config | `≤` si la valeur exacte manque |
 
 `host.state.focusedUsage` évite tout RPC pour les tokens : le Desktop diffuse
-déjà l'usage de la session focalisée. `process.list` est la seule RPC émise.
+déjà l'usage de la session focalisée. `process.list` est la seule RPC
+session-scopée ; `config.get` lit la configuration du profil propriétaire.
 
 ## Baseline du comptage de sous-agents
 
@@ -122,7 +125,8 @@ utilisé.
 ## Invariants de sécurité
 
 - Aucune lecture de `state.db`, de transcription ou de secret.
-- `config.get` ne sert qu'à lire le bloc `compression` ; rien d'autre n'est
+- `config.get` ne sert qu'à lire la configuration complète du profil afin d'en
+  extraire `compression` et, si présent, `model.max_tokens` ; rien d'autre n'est
   conservé ni affiché.
 - Aucune mutation : pas de `slash.exec`, pas de `delegation.pause`, pas de
   `process.kill`.
@@ -147,10 +151,10 @@ le réintroduit (vérifié en le remettant).
 
 ### Seuil faux affiché avec assurance (élevé)
 
-Voir la section 3 ci-dessus. La dérivation depuis la configuration ne reproduit
-ni le plancher 512k, ni la soustraction de `max_tokens`, ni la sémantique de
-plafond de `threshold_tokens`. Elle est supprimée : le plugin n'affiche que ce
-que le runtime rapporte.
+Voir la section 3 ci-dessus. La dérivation ne prétend plus être exacte quand
+`max_tokens` manque : elle affiche une borne haute `≤`, reproduit le plancher
+512k, la fenêtre effective et la sémantique de plafond de `threshold_tokens`, et
+réserve le seuil exact au runtime ou à une configuration complète.
 
 ### Comptage de sous-agents sans baseline (élevé)
 
